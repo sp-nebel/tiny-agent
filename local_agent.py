@@ -253,8 +253,14 @@ def t_read_file(path, start=1, end=None):
 
     total = len(lines)
     start = max(1, int(start))
-    end   = int(end) if end else min(total, start + MAX_READ_LINES - 1)
-    end   = min(end, total)
+    if start > total:
+        return f"[start={start} is beyond end of file ({total} lines)]"
+    # Cap the range even when end is explicit, so a huge end can't pull in
+    # the whole file in one call.
+    end = int(end) if end else total
+    end = min(end, total, start + MAX_READ_LINES - 1)
+    if end < start:
+        return f"[invalid range: end={end} is before start={start}]"
 
     body = "".join(f"{n:5}  {ln}" for n, ln in enumerate(lines[start-1:end], start=start))
     if body and not body.endswith("\n"):
@@ -268,7 +274,10 @@ def t_grep(pattern, path=".", ignore_case=False, word=False, fixed=False,
            context=0, before=0, after=0):
     # Base command differs (rg vs grep), but every flag below is accepted
     # identically by both, so the model sees one consistent interface.
-    cmd = ["rg", "-n", "--no-heading"] if shutil.which("rg") else ["grep", "-rn"]
+    if shutil.which("rg"):
+        cmd = ["rg", "-n", "--no-heading"]   # respects .gitignore by default
+    else:
+        cmd = ["grep", "-rn"] + [f"--exclude-dir={d}" for d in sorted(SKIP_DIRS)]
     if ignore_case:
         cmd.append("-i")
     if word:
@@ -287,7 +296,11 @@ def t_grep(pattern, path=".", ignore_case=False, word=False, fixed=False,
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=CMD_TIMEOUT)
     except subprocess.TimeoutExpired:
         return "[grep timed out]"
-    res   = (out.stdout or out.stderr).strip()
+    # rg and grep agree: exit 0 = matches, 1 = no matches, ≥2 = real error
+    # (bad regex, unreadable path). Don't let an error message pass as hits.
+    if out.returncode > 1:
+        return f"[grep error: {out.stderr.strip() or f'exit {out.returncode}'}]"
+    res   = out.stdout.strip()
     hits  = res.splitlines()
     if len(hits) > MAX_GREP_HITS:
         res = "\n".join(hits[:MAX_GREP_HITS]) + f"\n[+{len(hits) - MAX_GREP_HITS} more matches]"
@@ -492,11 +505,14 @@ def call_ollama(messages):
     try:
         resp = urllib.request.urlopen(req)
     except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
         # Model doesn't support the `think` parameter — disable and retry once
-        # so non-thinking models (the default) keep working.
-        if THINK and e.code == 400:
+        # so non-thinking models (the default) keep working. Other 400s (no
+        # tool support, bad request) must surface, so check the error body.
+        if THINK and e.code == 400 and "think" in body.lower():
             THINK = False
             return call_ollama(messages)
+        e.body = body   # already consumed; stash for the handler in main()
         raise
 
     # cbreak lets us catch a single cancel keypress without blocking the
@@ -512,7 +528,10 @@ def call_ollama(messages):
                 raw = raw.strip()
                 if not raw:
                     continue
-                obj = json.loads(raw)
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue   # malformed chunk (e.g. server hiccup) — skip it
                 msg = obj.get("message", {})
 
                 # Reasoning streams in its own field (models that emit it).
@@ -607,24 +626,34 @@ def run_turn(messages, max_steps=20):
             console.print(Markdown(content))
             return
 
-        # Execute each requested tool and feed results back.
-        for tc in tool_calls:
-            fn   = tc.get("function", {})
-            name = fn.get("name", "")
-            args = fn.get("arguments", {})
-            if isinstance(args, str):
-                # Some model versions return arguments as a JSON string.
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
+        # Execute each requested tool and feed results back. The finally
+        # block appends stub results for any calls that never ran (e.g.
+        # Ctrl-C mid-tool), so the history never carries an assistant
+        # message with unanswered tool_calls into the next request.
+        answered = 0
+        try:
+            for tc in tool_calls:
+                fn   = tc.get("function", {})
+                name = fn.get("name", "")
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    # Some model versions return arguments as a JSON string.
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
 
-            console.print(f"[cyan]→ {name}({fmt_args(args)})[/cyan]")
-            result = dispatch(name, args)
-            console.print(f"[dim]{truncate(result)}[/dim]\n")
+                console.print(f"[cyan]→ {name}({fmt_args(args)})[/cyan]")
+                result = dispatch(name, args)
+                console.print(f"[dim]{truncate(result)}[/dim]\n")
 
-            # Tool results use role "tool", one message per call.
-            messages.append({"role": "tool", "content": result, "name": name})
+                # Tool results use role "tool", one message per call.
+                messages.append({"role": "tool", "content": result, "name": name})
+                answered += 1
+        finally:
+            for tc in tool_calls[answered:]:
+                name = tc.get("function", {}).get("name", "tool")
+                messages.append({"role": "tool", "content": "[interrupted before this tool ran]", "name": name})
 
     console.print("[yellow]hit max steps without finishing[/yellow]")
 
@@ -693,6 +722,9 @@ def main():
 
         try:
             run_turn(messages, max_steps=args.max_steps)
+        except urllib.error.HTTPError as e:
+            body = getattr(e, "body", "") or e.read().decode(errors="replace")
+            console.print(f"[red]Ollama error {e.code}: {body.strip() or e.reason}[/red]")
         except urllib.error.URLError as e:
             console.print(f"[red]cannot reach Ollama at {OLLAMA_URL}: {e}[/red]")
         except KeyboardInterrupt:
