@@ -70,7 +70,7 @@ MODEL       = os.environ.get("AGENT_MODEL", "gemma4:latest")
 MAX_READ_LINES = 100
 MAX_GREP_HITS  = 20
 MAX_GLOB_HITS  = 100
-MAX_CMD_CHARS  = 128000
+MAX_CMD_CHARS  = 8000
 CMD_TIMEOUT    = 120
 NUM_CTX        = 32768
 
@@ -456,13 +456,34 @@ def _render_stream(thinking: str, content: str) -> Text:
     Lives only in the transient Live region, so when the stream finishes the
     whole thing — thinking included — is wiped and run_turn re-renders just
     the final content as Markdown.
+
+    The reasoning is shown through a sliding window over its tail: Rich's Live
+    region crops anything taller than the terminal from the *bottom*, which
+    would hide the newest streamed tokens. Instead we keep the view within the
+    terminal height ourselves — answer in full, plus as many of the most recent
+    thinking lines as fit above it — so the live tail is always what you see.
     """
-    out = Text()
+    avail = max(4, console.size.height - 2)
+    out   = Text()
+
+    content_lines = content.splitlines() if content else []
+    # Reserve rows for the answer; the rest is the reasoning window. -2 leaves
+    # room for the "thinking" header and the blank separator line.
+    think_budget = max(3, avail - len(content_lines) - 2)
+
     if thinking:
-        out.append("thinking\n", style="dim italic")
-        out.append(thinking + ("\n\n" if content else ""), style="dim italic")
+        tlines = thinking.splitlines() or [thinking]
+        hidden = len(tlines) - think_budget
+        if hidden > 0:
+            tlines = tlines[-think_budget:]
+            out.append(f"thinking (…{hidden} earlier line{'s' if hidden != 1 else ''})\n",
+                       style="dim italic")
+        else:
+            out.append("thinking\n", style="dim italic")
+        out.append("\n".join(tlines) + ("\n\n" if content else ""), style="dim italic")
+
     if content:
-        out.append(content, style="dim")
+        out.append("\n".join(content_lines), style="dim")
     return out
 
 
