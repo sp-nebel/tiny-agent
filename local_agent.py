@@ -41,9 +41,11 @@ import os
 import sys
 import glob
 import json
+import time
 import select
 import shutil
 import argparse
+import threading
 import subprocess
 import contextlib
 import urllib.request
@@ -74,11 +76,14 @@ MAX_CMD_CHARS  = 8000
 CMD_TIMEOUT    = 120
 NUM_CTX        = 32768
 
-# History trimming: keep the N most recent tool outputs verbatim and collapse
-# older ones to a stub, so the context window (and per-turn prefill) doesn't
-# grow without bound. Only outputs longer than the threshold are collapsed.
+# History trimming: when the conversation approaches the context window,
+# collapse all but the N most recent tool outputs to a one-line stub. Editing
+# history busts the KV prefix cache from the edit point on, so trimming only
+# happens when the window is actually under pressure — one cache bust per
+# long session, not one per step. Only outputs over the threshold collapse.
 KEEP_FULL_TOOL_RESULTS = 3
 TRIM_MIN_CHARS         = 400
+TRIM_AT_TOKENS         = int(NUM_CTX * 0.7)
 
 # Directories never worth walking in a glob.
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv",
@@ -412,7 +417,13 @@ def t_run_cmd(cmd):
         return f"[timed out after {CMD_TIMEOUT}s]"
     combined = (out.stdout + out.stderr).strip()
     if len(combined) > MAX_CMD_CHARS:
-        combined = combined[:MAX_CMD_CHARS] + "\n[output truncated]"
+        # Keep head AND tail: test runners and builds put the failure summary
+        # at the end, and losing it makes the model re-run the command.
+        head = MAX_CMD_CHARS // 4
+        tail = MAX_CMD_CHARS - head
+        combined = (combined[:head]
+                    + f"\n[… {len(combined) - MAX_CMD_CHARS} chars elided …]\n"
+                    + combined[-tail:])
     return combined or f"[exit {out.returncode}, no output]"
 
 
@@ -542,6 +553,7 @@ def call_ollama(messages):
     thinking   = ""
     tool_calls = []
     cancelled  = False
+    last_paint = 0.0
 
     try:
         resp = urllib.request.urlopen(req)
@@ -585,8 +597,12 @@ def call_ollama(messages):
                 if delta:
                     content += delta
 
-                if tdelta or delta:
+                # Rebuilding the renderable is O(accumulated text), so doing
+                # it per chunk goes quadratic and steals CPU from inference.
+                # Live paints at 8 fps anyway; skip updates it would never show.
+                if (tdelta or delta) and time.monotonic() - last_paint >= 0.12:
                     live.update(_render_stream(thinking, content))
+                    last_paint = time.monotonic()
 
                 # Tool calls appear in a dedicated field, often in a chunk
                 # where content is empty.
@@ -598,6 +614,38 @@ def call_ollama(messages):
                     break
 
     return content, tool_calls, cancelled
+
+
+def warm_cache():
+    """Prefill the static prefix (system prompt + tool schemas) in the
+    background so the model is loaded and the KV cache is warm by the time the
+    user finishes typing their first prompt.
+
+    Options must match call_ollama exactly — a different num_ctx would make
+    Ollama reload the model and waste the warmup. Failures are ignored; the
+    real call will surface them.
+    """
+    payload = {
+        "model":      MODEL,
+        "messages":   [{"role": "system", "content": SYSTEM}],
+        "tools":      TOOL_SCHEMAS,
+        "stream":     False,
+        "keep_alive": "30m",
+        "options": {
+            "num_ctx":     NUM_CTX,
+            "num_predict": 1,
+        },
+    }
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            resp.read()
+    except OSError:
+        pass
 
 # --------------------------------------------------------------------------- #
 # Display helpers
@@ -621,16 +669,21 @@ def truncate(text: str, n: int = 600) -> str:
 def trim_history(messages):
     """Collapse old tool outputs in place to conserve the context window.
 
-    The KEEP_FULL_TOOL_RESULTS most recent tool results stay verbatim; older
-    ones are replaced by a one-line stub. The model almost never needs the raw
-    bytes of a file it read many steps ago, but those bytes are re-prefilled on
-    every turn — so dropping them keeps both the window and per-turn prefill
-    bounded.
+    Untouched history is free: it sits in the KV prefix cache and is never
+    re-prefilled. Editing a message, by contrast, invalidates the cache from
+    the edit point on. So trimming is lazy — do nothing until the conversation
+    approaches the context window, then collapse every tool result outside the
+    keep-window in one pass. One cache bust per long session, not one per step.
+
+    The token estimate uses the ~4 chars/token heuristic; it only needs to be
+    right to within the 30% headroom left below NUM_CTX.
 
     Idempotent by construction: a stub is shorter than TRIM_MIN_CHARS, so it is
-    never re-collapsed. Each tool result is therefore edited at most once, which
-    keeps the prefix stable for the KV cache after that one-time change.
+    never re-collapsed, and a trimmed history sits well under the threshold.
     """
+    approx_tokens = sum(len(m.get("content") or "") for m in messages) // 4
+    if approx_tokens < TRIM_AT_TOKENS:
+        return
     tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     old = tool_idxs[:-KEEP_FULL_TOOL_RESULTS] if KEEP_FULL_TOOL_RESULTS else tool_idxs
     for i in old:
@@ -721,14 +774,20 @@ def main():
     cwd_context    = f"Working directory: {os.getcwd()}\n\n"
     first_user_msg = True
 
+    initial = " ".join(args.prompt).strip()
+
+    # Interactive start: prefill the static prefix while the user types their
+    # first prompt. With an argv prompt the real request follows immediately,
+    # so a warmup would just queue ahead of it for no gain.
+    if not initial:
+        threading.Thread(target=warm_cache, daemon=True).start()
+
     console.print(f"[bold]mini-agent[/bold] · {MODEL} · {os.getcwd()}")
     console.print(
-        "[dim]first reply is slow (system prompt + tool schemas prefill); "
-        "later turns reuse the KV cache. press Esc/q to cancel a reply, "
-        "'/clear' to reset context, 'exit' to quit.[/dim]\n"
+        "[dim]model warms up in the background; the first reply is slow if it "
+        "hasn't finished. later turns reuse the KV cache. press Esc/q to "
+        "cancel a reply, '/clear' to reset context, 'exit' to quit.[/dim]\n"
     )
-
-    initial = " ".join(args.prompt).strip()
 
     while True:
         if initial:
