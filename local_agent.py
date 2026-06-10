@@ -30,7 +30,7 @@ Usage:
     python mini_agent.py            # interactive; seed a task at the prompt
 
 Env vars:
-    AGENT_MODEL   (default: gemma3:4b)   — any Ollama model with tool support
+    AGENT_MODEL   (default: gemma4:latest)   — any Ollama model with tool support
     OLLAMA_URL    (default: http://localhost:11434)
 
 Dependency: pip install rich
