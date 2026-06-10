@@ -69,7 +69,7 @@ MODEL       = os.environ.get("AGENT_MODEL", "gemma4:latest")
 
 MAX_READ_LINES = 100
 MAX_GREP_HITS  = 20
-MAX_GLOB_HITS  = 100
+MAX_GLOB_HITS  = 20
 MAX_CMD_CHARS  = 8000
 CMD_TIMEOUT    = 120
 NUM_CTX        = 32768
