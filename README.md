@@ -1,3 +1,6 @@
+>[!WARNING]
+>Only vibecoding ahead
+
 # mini-agent
 
 A minimal local coding agent for CPU-bound machines, built around [Ollama](https://ollama.com).
