@@ -60,9 +60,10 @@ python local_agent.py
 | Tool | Description |
 |------|-------------|
 | `read_file` | Read a file with optional line range (capped at 100 lines per call) |
-| `grep` | Search files by regex, with rg/grep auto-detection |
+| `grep` | Search files by regex (with optional context lines), rg/grep auto-detection |
 | `find_files` | Glob-pattern file search |
 | `list_dir` | List directory contents |
+| `cd` | Change the working directory |
 | `edit_file` | Exact-string replacement edit, or create a new file |
 | `run_cmd` | Run a shell command |
 

@@ -136,18 +136,15 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search for a pattern in a file or directory tree. Returns matching lines with file path and line number.",
+            "description": "Search for a regex pattern in a file or directory tree. Returns matching lines with file path and line number.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern":     {"type": "string",  "description": "Search pattern (regex)"},
-                    "path":        {"type": "string",  "description": "File or directory to search (default '.')"},
-                    "ignore_case": {"type": "boolean", "description": "Case-insensitive match (-i)"},
-                    "word":        {"type": "boolean", "description": "Match whole words only (-w)"},
-                    "fixed":       {"type": "boolean", "description": "Treat pattern as a literal string, not a regex (-F)"},
-                    "context":     {"type": "integer", "description": "Show N lines of context before AND after each match (-C)"},
-                    "before":      {"type": "integer", "description": "Show N lines before each match (-B); ignored if context is set"},
-                    "after":       {"type": "integer", "description": "Show N lines after each match (-A); ignored if context is set"},
+                    "pattern": {"type": "string",  "description": "Search pattern (regex)"},
+                    "path":    {"type": "string",  "description": "File or directory to search (default '.')"},
+                    "context": {"type": "integer", "description": "Show N lines of context before AND after each match (-C)"},
+                    "before":  {"type": "integer", "description": "Show N lines before each match (-B); ignored if context is set"},
+                    "after":   {"type": "integer", "description": "Show N lines after each match (-A); ignored if context is set"},
                 },
                 "required": ["pattern"],
             },
@@ -183,6 +180,23 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "path": {"type": "string", "description": "Directory path (default '.')"},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cd",
+            "description": (
+                "Change the working directory. Relative paths in later tool "
+                "calls are resolved from here. Returns the new working directory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory to change into"},
+                },
+                "required": ["path"],
             },
         },
     },
@@ -270,20 +284,13 @@ def t_read_file(path, start=1, end=None):
     return body or "[empty file]"
 
 
-def t_grep(pattern, path=".", ignore_case=False, word=False, fixed=False,
-           context=0, before=0, after=0):
+def t_grep(pattern, path=".", context=0, before=0, after=0):
     # Base command differs (rg vs grep), but every flag below is accepted
     # identically by both, so the model sees one consistent interface.
     if shutil.which("rg"):
         cmd = ["rg", "-n", "--no-heading"]   # respects .gitignore by default
     else:
         cmd = ["grep", "-rn"] + [f"--exclude-dir={d}" for d in sorted(SKIP_DIRS)]
-    if ignore_case:
-        cmd.append("-i")
-    if word:
-        cmd.append("-w")
-    if fixed:
-        cmd.append("-F")
     if context:
         cmd += ["-C", str(int(context))]
     else:
@@ -333,6 +340,18 @@ def t_list_dir(path="."):
         return f"[error: {e}]"
     lines = [e + ("/" if os.path.isdir(os.path.join(path, e)) else "") for e in entries]
     return "\n".join(lines) or "[empty]"
+
+
+def t_cd(path):
+    try:
+        os.chdir(path)
+    except FileNotFoundError:
+        return f"[no such directory: {path}]"
+    except NotADirectoryError:
+        return f"[not a directory: {path}]"
+    except OSError as e:
+        return f"[error changing directory: {e}]"
+    return f"[cwd: {os.getcwd()}]"
 
 
 def t_edit_file(path, old_string, new_string, replace_all=False):
@@ -402,6 +421,7 @@ TOOLS = {
     "grep":       t_grep,
     "find_files": t_find_files,
     "list_dir":   t_list_dir,
+    "cd":         t_cd,
     "edit_file":  t_edit_file,
     "run_cmd":    t_run_cmd,
 }
