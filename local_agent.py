@@ -42,8 +42,10 @@ import sys
 import glob
 import json
 import time
+import atexit
 import select
 import shutil
+import difflib
 import argparse
 import threading
 import subprocess
@@ -56,6 +58,11 @@ try:                      # POSIX-only; used to read a single cancel keypress
     import tty
 except ImportError:
     termios = tty = None
+
+try:                      # line editing + history for the interactive prompt
+    import readline
+except ImportError:
+    readline = None
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -259,6 +266,33 @@ def confirm(msg: str) -> bool:
     return ans in ("y", "yes")
 
 
+def show_diff(old: str, new: str, path: str, max_lines: int = 60):
+    """Print a colored unified diff so edit confirmations aren't blind.
+
+    Shown even under --yes: it costs nothing and is the only record of what
+    the agent actually changed.
+    """
+    diff = list(difflib.unified_diff(
+        old.splitlines(), new.splitlines(),
+        fromfile=f"{path} (old)", tofile=f"{path} (new)", lineterm="",
+    ))
+    if len(diff) > max_lines:
+        hidden = len(diff) - max_lines
+        diff = diff[:max_lines] + [f"… ({hidden} more diff lines)"]
+    out = Text()
+    for line in diff:
+        if line.startswith("+") and not line.startswith("+++"):
+            style = "green"
+        elif line.startswith("-") and not line.startswith("---"):
+            style = "red"
+        elif line.startswith("@@"):
+            style = "cyan"
+        else:
+            style = "dim"
+        out.append(line + "\n", style=style)
+    console.print(out, end="")
+
+
 def t_read_file(path, start=1, end=None):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -364,6 +398,7 @@ def t_edit_file(path, old_string, new_string, replace_all=False):
     if old_string == "":
         if os.path.exists(path):
             return f"[{path} already exists; put the text to replace in old_string]"
+        show_diff("", new_string, path)
         if not confirm(f"create {path} ({len(new_string)} chars)?"):
             return "[user declined write]"
         try:
@@ -396,6 +431,7 @@ def t_edit_file(path, old_string, new_string, replace_all=False):
     n           = count if replace_all else 1
     new_content = content.replace(old_string, new_string, -1 if replace_all else 1)
     plural      = "s" if n != 1 else ""
+    show_diff(content, new_content, path)
     if not confirm(f"edit {path} ({n} replacement{plural})?"):
         return "[user declined write]"
     try:
@@ -518,15 +554,31 @@ def _render_stream(thinking: str, content: str) -> Text:
     return out
 
 
+def fmt_stats(done_obj: dict) -> str:
+    """One-line turn stats from the final stream chunk.
+
+    prompt_eval_count is only the tokens prefilled *this* call — tokens served
+    from the KV prefix cache are not counted. So a small prefill number on a
+    long conversation is the visible proof that the cache is doing its job.
+    """
+    p_tok = done_obj.get("prompt_eval_count", 0)
+    p_dur = done_obj.get("prompt_eval_duration", 0) / 1e9
+    g_tok = done_obj.get("eval_count", 0)
+    g_dur = done_obj.get("eval_duration", 0) / 1e9
+    rate  = f"{g_tok / g_dur:.1f} tok/s" if g_dur else "—"
+    return f"prefill {p_tok} tok in {p_dur:.1f}s · gen {g_tok} tok @ {rate}"
+
+
 def call_ollama(messages):
     """Stream a chat turn.
 
-    Returns (content: str, tool_calls: list, cancelled: bool).
+    Returns (content: str, tool_calls: list, cancelled: bool, stats: str).
     Exactly one of content/tool_calls is meaningful: a final answer has
     content and no tool_calls; a tool-calling turn has tool_calls. Reasoning
     arrives in a separate `thinking` field; it is shown live but never
     returned, so it is discarded once the answer is rendered. cancelled is
-    True if the user pressed the cancel key (Esc/q) mid-stream.
+    True if the user pressed the cancel key (Esc/q) mid-stream; stats is
+    empty in that case (the final chunk never arrived).
     """
     global THINK
 
@@ -553,6 +605,7 @@ def call_ollama(messages):
     thinking   = ""
     tool_calls = []
     cancelled  = False
+    stats      = ""
     last_paint = 0.0
 
     try:
@@ -611,9 +664,10 @@ def call_ollama(messages):
                     tool_calls.extend(tcs)
 
                 if obj.get("done"):
+                    stats = fmt_stats(obj)
                     break
 
-    return content, tool_calls, cancelled
+    return content, tool_calls, cancelled, stats
 
 
 def warm_cache():
@@ -700,13 +754,16 @@ def trim_history(messages):
 def run_turn(messages, max_steps=20):
     for _ in range(max_steps):
         trim_history(messages)
-        content, tool_calls, cancelled = call_ollama(messages)
+        content, tool_calls, cancelled, stats = call_ollama(messages)
 
         if cancelled:
             # User aborted mid-stream. Drop the partial reply (don't commit it
             # to history) and hand control back to the prompt.
             console.print("[yellow]cancelled[/yellow]")
             return
+
+        if stats:
+            console.print(f"[dim]{stats}[/dim]")
 
         # Build the assistant history entry. The Ollama API expects tool_calls
         # to be included in the message when present.
@@ -767,6 +824,19 @@ def main():
 
     MODEL    = args.model
     AUTO_YES = args.yes
+
+    # Persistent prompt history: importing readline upgrades input() in place,
+    # so console.input gets line editing and up-arrow recall for free.
+    if readline:
+        histfile = os.path.expanduser("~/.mini_agent_history")
+        with contextlib.suppress(OSError):
+            readline.read_history_file(histfile)
+        readline.set_history_length(500)
+
+        def save_history():
+            with contextlib.suppress(OSError):
+                readline.write_history_file(histfile)
+        atexit.register(save_history)
 
     messages = [{"role": "system", "content": SYSTEM}]
     # cwd injected into the FIRST user message only — keeps the system prompt

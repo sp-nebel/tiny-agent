@@ -54,6 +54,7 @@ python local_agent.py
 | `exit` / `quit` | Quit the agent |
 | `/clear` | Reset conversation history (system prompt and tool schemas stay cached) |
 | Esc / `q` during a reply | Cancel the in-flight response |
+| Up / Down arrows | Recall previous prompts (history persists in `~/.mini_agent_history`) |
 
 ## Tools available to the model
 
@@ -67,7 +68,9 @@ python local_agent.py
 | `edit_file` | Exact-string replacement edit, or create a new file |
 | `run_cmd` | Run a shell command |
 
-`edit_file` and `run_cmd` ask for confirmation before executing unless `--yes` is passed.
+`edit_file` and `run_cmd` ask for confirmation before executing unless `--yes` is passed. Edits show a colored unified diff before the confirmation prompt (and under `--yes`, as a record of what changed).
+
+After each model turn a dim stats line is printed, e.g. `prefill 142 tok in 3.2s · gen 56 tok @ 8.4 tok/s`. The prefill count covers only tokens *not* served from the KV prefix cache, so a small number on a long conversation means the prefix caching is working.
 
 ## Design notes
 
