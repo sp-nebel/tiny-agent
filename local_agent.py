@@ -118,6 +118,10 @@ Work lazily: use grep to locate relevant code, then read_file with a tight
 line range around what you actually need. Do not read whole files when a
 small range will do. Make one tool call at a time and wait for its result.
 
+Bracketed lines like [lines 1-100 of 543] in tool results are metadata from
+the tool, not file content. If a read was truncated and you need more of the
+file, call read_file again with the start value the notice gives you.
+
 When the task is done, reply in Markdown with no tool call."""
 
 # --------------------------------------------------------------------------- #
@@ -125,25 +129,6 @@ When the task is done, reply in Markdown with no tool call."""
 # --------------------------------------------------------------------------- #
 
 TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": (
-                "Read a file. Output is line-numbered. "
-                "Use start/end to read a specific range rather than the whole file."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path":  {"type": "string",  "description": "File path"},
-                    "start": {"type": "integer", "description": "First line to read (1-indexed, default 1)"},
-                    "end":   {"type": "integer", "description": "Last line to read (inclusive)"},
-                },
-                "required": ["path"],
-            },
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -159,6 +144,29 @@ TOOL_SCHEMAS = [
                     "after":   {"type": "integer", "description": "Show N lines after each match (-A); ignored if context is set"},
                 },
                 "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read a file. Output is line-numbered. "
+                "Use start/end to read a specific range rather than the whole file. "
+                "Returns at most 100 lines per call. If the requested range is "
+                "longer, the result ends with a bracketed notice giving the start "
+                "value for the next call - that notice is tool metadata, not file "
+                "content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":  {"type": "string",  "description": "File path"},
+                    "start": {"type": "integer", "description": "First line to read (1-indexed, default 1)"},
+                    "end":   {"type": "integer", "description": "Last line to read (inclusive)"},
+                },
+                "required": ["path"],
             },
         },
     },
@@ -319,7 +327,13 @@ def t_read_file(path, start=1, end=None):
     if body and not body.endswith("\n"):
         body += "\n"
     if end < total:
-        body += f"[showing lines {start}–{end} of {total}; read more with start={end+1}]"
+        # Notice at both ends: small models attend poorly to the tail of a
+        # long result, and an imperative is followed better than a hint.
+        body = (
+            f"[lines {start}-{end} of {total} - file continues]\n"
+            + body
+            + f"[TRUNCATED. To continue reading, call read_file with start={end+1}.]"
+        )
     return body or "[empty file]"
 
 
