@@ -52,8 +52,8 @@ python local_agent.py
 | Input | Effect |
 |-------|--------|
 | `exit` / `quit` | Quit the agent |
-| `/clear` | Reset conversation history (system prompt and tool schemas stay cached) |
-| Esc / `q` during a reply | Cancel the in-flight response |
+| `/clear` or `clear` | Reset conversation history (system prompt and tool schemas stay cached) |
+| Esc / `q` / `Q` during a reply | Cancel the in-flight response |
 | Up / Down arrows | Recall previous prompts (history persists in `~/.mini_agent_history`) |
 
 ## Tools available to the model
