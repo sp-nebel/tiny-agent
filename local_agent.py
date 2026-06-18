@@ -568,31 +568,35 @@ def _render_stream(thinking: str, content: str) -> Text:
     return out
 
 
-def fmt_stats(done_obj: dict) -> str:
-    """One-line turn stats from the final stream chunk.
+def fmt_stats(stats: dict, calls: int) -> str:
+    """One-line summary of a whole turn, summed across its `calls` LLM calls.
 
-    prompt_eval_count is only the tokens prefilled *this* call — tokens served
-    from the KV prefix cache are not counted. So a small prefill number on a
-    long conversation is the visible proof that the cache is doing its job.
+    A turn fans out into several call_ollama requests (one per tool round-trip),
+    so these are turn totals: prefill is the total tokens prefilled across the
+    turn — the first call dominates it, since later calls reuse the KV prefix
+    cache and only prefill the new tool results — and the rate is the
+    token-weighted gen tok/s (summed eval_count over summed eval_duration).
     """
-    p_tok = done_obj.get("prompt_eval_count", 0)
-    p_dur = done_obj.get("prompt_eval_duration", 0) / 1e9
-    g_tok = done_obj.get("eval_count", 0)
-    g_dur = done_obj.get("eval_duration", 0) / 1e9
+    p_tok = stats.get("prompt_eval_count", 0)
+    p_dur = stats.get("prompt_eval_duration", 0) / 1e9
+    g_tok = stats.get("eval_count", 0)
+    g_dur = stats.get("eval_duration", 0) / 1e9
     rate  = f"{g_tok / g_dur:.1f} tok/s" if g_dur else "—"
-    return f"prefill {p_tok} tok in {p_dur:.1f}s · gen {g_tok} tok @ {rate}"
+    prefix = f"{calls} steps · " if calls > 1 else ""
+    return f"{prefix}prefill {p_tok} tok in {p_dur:.1f}s · gen {g_tok} tok @ {rate}"
 
 
 def call_ollama(messages):
     """Stream a chat turn.
 
-    Returns (content: str, tool_calls: list, cancelled: bool, stats: str).
+    Returns (content: str, tool_calls: list, cancelled: bool, stats: dict).
     Exactly one of content/tool_calls is meaningful: a final answer has
     content and no tool_calls; a tool-calling turn has tool_calls. Reasoning
     arrives in a separate `thinking` field; it is shown live but never
     returned, so it is discarded once the answer is rendered. cancelled is
-    True if the user pressed the cancel key (Esc/q) mid-stream; stats is
-    empty in that case (the final chunk never arrived).
+    True if the user pressed the cancel key (Esc/q) mid-stream; stats is a
+    dict of raw token counters from the final chunk, empty ({}) in that case
+    (the final chunk never arrived) — run_turn sums it across the turn.
     """
     global THINK
 
@@ -619,7 +623,7 @@ def call_ollama(messages):
     thinking   = ""
     tool_calls = []
     cancelled  = False
-    stats      = ""
+    stats      = {}
     last_paint = 0.0
 
     try:
@@ -678,7 +682,14 @@ def call_ollama(messages):
                     tool_calls.extend(tcs)
 
                 if obj.get("done"):
-                    stats = fmt_stats(obj)
+                    # Raw counters; run_turn sums these across the turn and
+                    # formats one line at the end via fmt_stats.
+                    stats = {
+                        "prompt_eval_count":    obj.get("prompt_eval_count", 0),
+                        "prompt_eval_duration": obj.get("prompt_eval_duration", 0),
+                        "eval_count":           obj.get("eval_count", 0),
+                        "eval_duration":        obj.get("eval_duration", 0),
+                    }
                     break
 
     return content, tool_calls, cancelled, stats
@@ -766,6 +777,11 @@ def trim_history(messages):
 
 
 def run_turn(messages, max_steps=20):
+    # A turn fans out into several call_ollama requests (one per tool
+    # round-trip); sum their stats and print one summary line when the turn
+    # finishes, rather than a line per call.
+    turn_stats = {}
+    calls = 0
     for _ in range(max_steps):
         trim_history(messages)
         content, tool_calls, cancelled, stats = call_ollama(messages)
@@ -777,7 +793,9 @@ def run_turn(messages, max_steps=20):
             return
 
         if stats:
-            console.print(f"[dim]{stats}[/dim]")
+            calls += 1
+            for k, v in stats.items():
+                turn_stats[k] = turn_stats.get(k, 0) + v
 
         # Build the assistant history entry. The Ollama API expects tool_calls
         # to be included in the message when present.
@@ -787,8 +805,10 @@ def run_turn(messages, max_steps=20):
         messages.append(assistant_msg)
 
         if not tool_calls:
-            # Final answer — render as Markdown.
+            # Final answer — render as Markdown, then the turn summary.
             console.print(Markdown(content))
+            if turn_stats:
+                console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
             return
 
         # Execute each requested tool and feed results back. The finally
@@ -821,6 +841,8 @@ def run_turn(messages, max_steps=20):
                 messages.append({"role": "tool", "content": "[interrupted before this tool ran]", "name": name})
 
     console.print("[yellow]hit max steps without finishing[/yellow]")
+    if turn_stats:
+        console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
 
 # --------------------------------------------------------------------------- #
 # CLI
