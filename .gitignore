@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / cached files
+*.py[cod]
+*?.pyc
+
+# Virtual environment and dependencies
+venv/
+env/
+*/venv/
+*/env/
+.Python
+
+# IDE and OS generated files
+.idea/          # PyCharm
+.vscode/        # VS Code settings (if local machine-specific)
+.DS_Store       # macOS artifacts
+
+# Local development and agent caches
+.claude/        # Directory seen in listing
+__pycache__/    # Python cache directory
+
+# Compiled files (e.g., if using a build system later)
+build/
+dist/
+
+# Operating System Files
+Thumbs.db
