@@ -74,7 +74,7 @@ from rich.text import Text
 # --------------------------------------------------------------------------- #
 
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-MODEL       = os.environ.get("AGENT_MODEL", "gemma4:latest")
+MODEL       = os.environ.get("AGENT_MODEL", "gemma4:12b-it-qat")
 
 MAX_READ_LINES = 100
 MAX_GREP_HITS  = 20
