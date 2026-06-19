@@ -92,6 +92,25 @@ KEEP_FULL_TOOL_RESULTS = 3
 TRIM_MIN_CHARS         = 400
 TRIM_AT_TOKENS         = int(NUM_CTX * 0.7)
 
+# Summarize-on-trim: when trim_history collapses an old tool output, instead of
+# discarding it to a one-line stub, spawn a fresh empty Ollama session (same
+# resident model) to digest it down to the task-relevant facts and keep THAT.
+# Only ever runs at the trim moment — i.e. when the window is already under
+# pressure and the cache is being busted anyway — so it costs nothing on short
+# sessions. Disable with AGENT_SUMMARIZE_TRIM=0 to get the old [elided] stubs.
+SUMMARIZE_ON_TRIM  = os.environ.get("AGENT_SUMMARIZE_TRIM", "1") not in ("0", "false", "")
+SUMMARY_MAX_TOKENS = 256          # bounds the gen cost of each digest
+# Sentinel prefixing every compacted message. A summary can exceed
+# TRIM_MIN_CHARS, so "a stub is short → never re-collapsed" no longer holds;
+# trim_history skips anything already starting with this prefix instead.
+TRIM_PREFIX        = "[«compacted» "
+SUMMARIZER_SYSTEM  = (
+    "You compress one tool result for an autonomous coding agent. Given the "
+    "task it was gathered for and the raw output, return a terse factual digest "
+    "(at most ~8 lines) of ONLY what is relevant to the task: file paths, line "
+    "numbers, symbol names, key values, error messages. No preamble, no advice."
+)
+
 # Directories never worth walking in a glob.
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv",
              ".mypy_cache", ".pytest_cache", ".ruff_cache"}
@@ -726,6 +745,44 @@ def warm_cache():
     except OSError:
         pass
 
+
+def summarize_output(tool_name, content, task):
+    """Digest one oversized tool result down to its task-relevant facts.
+
+    Runs on a fresh, empty 2-message session against the same resident model:
+    no prior history, no tools (the summarizer must not call any), no thinking.
+    num_ctx matches call_ollama exactly so Ollama doesn't reload the model.
+
+    Returns the digest string, or None on any failure (or empty reply) so the
+    caller can fall back to the plain elision stub — summarization must never
+    break a turn.
+    """
+    payload = {
+        "model":      MODEL,
+        "messages": [
+            {"role": "system", "content": SUMMARIZER_SYSTEM},
+            {"role": "user",   "content": f"Task:\n{task}\n\n{tool_name} output:\n{content}"},
+        ],
+        "stream":     False,
+        "keep_alive": "30m",
+        "options": {
+            "num_ctx":     NUM_CTX,
+            "num_predict": SUMMARY_MAX_TOKENS,
+        },
+    }
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=CMD_TIMEOUT) as resp:
+            obj = json.loads(resp.read())
+    except (OSError, ValueError):
+        return None
+    text = (obj.get("message") or {}).get("content", "").strip()
+    return text or None
+
 # --------------------------------------------------------------------------- #
 # Display helpers
 # --------------------------------------------------------------------------- #
@@ -745,6 +802,14 @@ def truncate(text: str, n: int = 600) -> str:
 # Agent loop
 # --------------------------------------------------------------------------- #
 
+# Appended at the tail on the final allowed step to force a closing answer
+# instead of yet another tool call. Tail-only, so the prefix cache is untouched.
+STEP_LIMIT_NUDGE = (
+    "[step limit reached — give your best final answer now using what you've "
+    "gathered; do not call any more tools.]"
+)
+
+
 def trim_history(messages):
     """Collapse old tool outputs in place to conserve the context window.
 
@@ -757,23 +822,37 @@ def trim_history(messages):
     The token estimate uses the ~4 chars/token heuristic; it only needs to be
     right to within the 30% headroom left below NUM_CTX.
 
-    Idempotent by construction: a stub is shorter than TRIM_MIN_CHARS, so it is
-    never re-collapsed, and a trimmed history sits well under the threshold.
+    When SUMMARIZE_ON_TRIM is set, each collapsed output is first run through
+    summarize_output (a fresh session on the same model) so the kept stub is an
+    informative digest rather than a bare "[elided]" line. That fires a burst of
+    summarizer calls, but only here — at the already-expensive trim moment — so
+    short sessions pay nothing. On failure it falls back to the plain stub.
+
+    Idempotent by construction: every collapsed message is prefixed with
+    TRIM_PREFIX and skipped on later passes (a length check no longer suffices,
+    since a digest can be longer than TRIM_MIN_CHARS).
     """
     approx_tokens = sum(len(m.get("content") or "") for m in messages) // 4
     if approx_tokens < TRIM_AT_TOKENS:
         return
+    task = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
     tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     old = tool_idxs[:-KEEP_FULL_TOOL_RESULTS] if KEEP_FULL_TOOL_RESULTS else tool_idxs
-    for i in old:
+    targets = [i for i in old
+               if not (messages[i].get("content") or "").startswith(TRIM_PREFIX)
+               and len(messages[i].get("content") or "") > TRIM_MIN_CHARS]
+    if not targets:
+        return
+    console.print(f"[dim]compacting {len(targets)} old tool output"
+                  f"{'s' if len(targets) != 1 else ''}…[/dim]")
+    for i in targets:
         m       = messages[i]
         content = m.get("content", "")
-        if len(content) > TRIM_MIN_CHARS:
-            nlines = content.count("\n") + 1
-            m["content"] = (
-                f"[{m.get('name', 'tool')} output elided — "
-                f"{nlines} lines, {len(content)} chars]"
-            )
+        name    = m.get("name", "tool")
+        nlines  = content.count("\n") + 1
+        marker  = f"{TRIM_PREFIX}{name} — was {nlines} lines, {len(content)} chars]"
+        summary = summarize_output(name, content, task) if SUMMARIZE_ON_TRIM else None
+        m["content"] = f"{marker}\n{summary}" if summary else marker
 
 
 def run_turn(messages, max_steps=20):
@@ -782,8 +861,16 @@ def run_turn(messages, max_steps=20):
     # finishes, rather than a line per call.
     turn_stats = {}
     calls = 0
-    for _ in range(max_steps):
+    for step in range(max_steps):
         trim_history(messages)
+        # Last allowed step: force an answer. We keep the tool schemas in the
+        # payload (dropping them would shift the cached prefix and bust nearly
+        # the whole prefill) and instead append a nudge at the *tail* — only its
+        # own tokens prefill, so the prefix cache stays intact.
+        last = step == max_steps - 1
+        if last:
+            messages.append({"role": "user", "content": STEP_LIMIT_NUDGE})
+
         content, tool_calls, cancelled, stats = call_ollama(messages)
 
         if cancelled:
@@ -797,16 +884,25 @@ def run_turn(messages, max_steps=20):
             for k, v in stats.items():
                 turn_stats[k] = turn_stats.get(k, 0) + v
 
+        # On the forced final step we treat the reply as the answer and drop any
+        # tool_calls it may still carry: we're out of budget, and storing
+        # unanswered tool_calls would corrupt history for the next turn.
+        keep_tc = bool(tool_calls) and not last
+
         # Build the assistant history entry. The Ollama API expects tool_calls
         # to be included in the message when present.
         assistant_msg = {"role": "assistant", "content": content}
-        if tool_calls:
+        if keep_tc:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
 
-        if not tool_calls:
-            # Final answer — render as Markdown, then the turn summary.
-            console.print(Markdown(content))
+        if not keep_tc:
+            # Final answer (normal early finish, or the forced last step) —
+            # render as Markdown, then the turn summary.
+            if content.strip():
+                console.print(Markdown(content))
+            else:
+                console.print("[yellow]hit step limit; model returned no answer[/yellow]")
             if turn_stats:
                 console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
             return
@@ -840,10 +936,6 @@ def run_turn(messages, max_steps=20):
                 name = tc.get("function", {}).get("name", "tool")
                 messages.append({"role": "tool", "content": "[interrupted before this tool ran]", "name": name})
 
-    console.print("[yellow]hit max steps without finishing[/yellow]")
-    if turn_stats:
-        console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
-
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -855,7 +947,7 @@ def main():
     ap.add_argument("prompt",      nargs="*",      help="initial task (optional)")
     ap.add_argument("--model",     default=MODEL,  help=f"Ollama model tag (default: {MODEL})")
     ap.add_argument("--yes",       action="store_true", help="auto-approve writes and commands")
-    ap.add_argument("--max-steps", type=int, default=10, help="max tool calls per task")
+    ap.add_argument("--max-steps", type=int, default=20, help="max tool calls per task")
     args = ap.parse_args()
 
     MODEL    = args.model

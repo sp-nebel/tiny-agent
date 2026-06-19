@@ -46,6 +46,7 @@ python local_agent.py
 | `AGENT_MODEL` | `gemma4:latest` | Ollama model tag (overridden by `--model`) |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API base URL |
 | `AGENT_THINK` | `1` | Set to `0` to disable reasoning output |
+| `AGENT_SUMMARIZE_TRIM` | `1` | Set to `0` to elide trimmed tool outputs instead of summarizing them |
 
 ### Interactive commands
 
@@ -80,6 +81,8 @@ After each model turn a dim stats line is printed, e.g. `prefill 142 tok in 3.2s
 
 **Lazy context** — the model is not front-loaded with files. It greps to locate code and then reads a tight line range. This keeps per-turn prefill small.
 
-**History trimming** — old tool outputs are collapsed to stubs after a few turns, bounding both context-window usage and per-turn prefill cost.
+**History trimming** — when the conversation crosses ~70% of the context window, old tool outputs (all but the last few) are collapsed in one pass, bounding context-window usage. Trimming is lazy because editing history busts the KV cache from the edit point on, so it happens once per long session rather than every turn.
+
+**Summarize-on-trim** — rather than discarding a collapsed output to a bare `[elided]` stub, the agent spawns a fresh, empty Ollama session on the *same* resident model to digest it down to the task-relevant facts (paths, line numbers, names, errors) and keeps that digest. This only ever runs at the trim moment — when the window is already under pressure and the cache is being busted anyway — so short sessions pay nothing for it. Failures fall back to the plain stub. Disable with `AGENT_SUMMARIZE_TRIM=0`.
 
 **Native tool calling** — tools are passed via Ollama's `tools` parameter as JSON schemas, not described in the system prompt, so the model uses the format it was actually trained on.
