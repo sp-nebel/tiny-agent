@@ -855,7 +855,7 @@ def main():
     ap.add_argument("prompt",      nargs="*",      help="initial task (optional)")
     ap.add_argument("--model",     default=MODEL,  help=f"Ollama model tag (default: {MODEL})")
     ap.add_argument("--yes",       action="store_true", help="auto-approve writes and commands")
-    ap.add_argument("--max-steps", type=int, default=20, help="max tool calls per task")
+    ap.add_argument("--max-steps", type=int, default=10, help="max tool calls per task")
     args = ap.parse_args()
 
     MODEL    = args.model
