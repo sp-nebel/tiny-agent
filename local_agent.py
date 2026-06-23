@@ -795,8 +795,16 @@ def fmt_args(args: dict) -> str:
     return ", ".join(parts)
 
 
+def approx_tokens(text: str) -> int:
+    """Rough token count from the ~4-chars/token heuristic (the same estimate
+    trim_history uses for its window-pressure check). Ollama exposes no
+    tokenizer endpoint, so this is a display-only approximation — exact counts
+    are only available for whole LLM calls, via the stats in fmt_stats."""
+    return len(text) // 4
+
+
 def truncate(text: str, n: int = 600) -> str:
-    return text if len(text) <= n else text[:n] + f"\n… ({len(text)} chars total)"
+    return text if len(text) <= n else text[:n] + f"\n… (~{approx_tokens(text)} tokens total)"
 
 # --------------------------------------------------------------------------- #
 # Agent loop
