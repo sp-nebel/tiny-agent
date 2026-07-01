@@ -957,18 +957,20 @@ def trim_history(messages):
 
 
 def run_turn(messages, max_steps=20):
+    # max_steps <= 0 means unlimited: no forced final step, no nudge.
     # A turn fans out into several call_ollama requests (one per tool
     # round-trip); sum their stats and print one summary line when the turn
     # finishes, rather than a line per call.
     turn_stats = {}
     calls = 0
-    for step in range(max_steps):
+    step = 0
+    while max_steps <= 0 or step < max_steps:
         trim_history(messages)
         # Last allowed step: force an answer. We keep the tool schemas in the
         # payload (dropping them would shift the cached prefix and bust nearly
         # the whole prefill) and instead append a nudge at the *tail* — only its
         # own tokens prefill, so the prefix cache stays intact.
-        last = step == max_steps - 1
+        last = max_steps > 0 and step == max_steps - 1
         if last:
             messages.append({"role": "user", "content": STEP_LIMIT_NUDGE})
 
@@ -1037,6 +1039,8 @@ def run_turn(messages, max_steps=20):
                 name = tc.get("function", {}).get("name", "tool")
                 messages.append({"role": "tool", "content": "[interrupted before this tool ran]", "name": name})
 
+        step += 1
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -1048,7 +1052,7 @@ def main():
     ap.add_argument("prompt",      nargs="*",      help="initial task (optional)")
     ap.add_argument("--model",     default=None,   help=f"Ollama model tag (default: {MODEL}, or the saved model when resuming)")
     ap.add_argument("--yes",       action="store_true", help="auto-approve writes and commands")
-    ap.add_argument("--max-steps", type=int, default=20, help="max tool calls per task")
+    ap.add_argument("--max-steps", type=int, default=20, help="max tool calls per task (0 = unlimited)")
     ap.add_argument("--resume",    nargs="?", const="", default=None,
                      help="resume a saved session by name; bare --resume resumes the most recent")
     args = ap.parse_args()

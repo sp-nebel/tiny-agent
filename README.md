@@ -37,7 +37,7 @@ python local_agent.py
 |------|---------|-------------|
 | `--model TAG` | `gemma4:12b-it-qat` | Ollama model tag |
 | `--yes` | off | Auto-approve all writes and shell commands |
-| `--max-steps N` | 20 | Max tool calls before giving up on a task |
+| `--max-steps N` | 20 | Max tool calls before giving up on a task (`0` = unlimited) |
 | `--resume [NAME]` | off | Resume a saved session by name; bare `--resume` resumes the most recent |
 
 ### Environment variables
