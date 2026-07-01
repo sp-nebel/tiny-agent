@@ -83,6 +83,22 @@ def trim_history(messages):
         m["content"] = f"{marker}\n{summary}" if summary else marker
 
 
+def drop_thinking(messages, start):
+    """Strip the `thinking` field off assistant messages from `start` onward.
+
+    Reasoning is fed back across a turn's tool round-trips (see run_turn) so the
+    model keeps its chain of thought while it works. Once the turn ends we drop
+    it: it has served its purpose, and leaving it would bloat the context window
+    and persist into saved sessions across turns. This edits committed history,
+    so it busts the KV prefix cache from the first stripped message on — paid
+    once at the turn boundary, the same one-cache-bust-when-it's-worth-it trade
+    trim_history makes.
+    """
+    for m in messages[start:]:
+        if m.get("role") == "assistant":
+            m.pop("thinking", None)
+
+
 def run_turn(messages, max_steps=20):
     # max_steps <= 0 means unlimited: no forced final step, no nudge.
     # A turn fans out into several call_ollama requests (one per tool
@@ -92,6 +108,9 @@ def run_turn(messages, max_steps=20):
     calls = 0
     step = 0
     empty_retries = 0
+    # Where this turn's messages begin, so drop_thinking can find them at the
+    # end and strip the reasoning we fed back across the turn's tool round-trips.
+    turn_start = len(messages)
     while max_steps <= 0 or step < max_steps:
         trim_history(messages)
         # Last allowed step: force an answer. We keep the tool schemas in the
@@ -102,11 +121,13 @@ def run_turn(messages, max_steps=20):
         if last:
             messages.append({"role": "user", "content": STEP_LIMIT_NUDGE})
 
-        content, tool_calls, cancelled, stats = call_ollama(messages)
+        content, thinking, tool_calls, cancelled, stats = call_ollama(messages)
 
         if cancelled:
             # User aborted mid-stream. Drop the partial reply (don't commit it
-            # to history) and hand control back to the prompt.
+            # to history) and hand control back to the prompt. The turn is over,
+            # so shed the reasoning fed back on earlier steps too.
+            drop_thinking(messages, turn_start)
             config.console.print("[yellow]cancelled[/yellow]")
             return
 
@@ -125,6 +146,12 @@ def run_turn(messages, max_steps=20):
         assistant_msg = {"role": "assistant", "content": content}
         if keep_tc:
             assistant_msg["tool_calls"] = tool_calls
+        # Carry the reasoning on the assistant message so the next step gets it
+        # back and can build on it instead of re-deriving from scratch after
+        # each tool result. Appended, not edited, so the prefix cache is intact;
+        # drop_thinking sheds it all once the turn produces a final answer.
+        if thinking:
+            assistant_msg["thinking"] = thinking
         messages.append(assistant_msg)
 
         if not keep_tc:
@@ -138,7 +165,9 @@ def run_turn(messages, max_steps=20):
                 continue
 
             # Final answer (normal early finish, or the forced last step) —
-            # render as Markdown, then the turn summary.
+            # the turn is done, so shed the reasoning we fed back across its
+            # steps, then render as Markdown and the turn summary.
+            drop_thinking(messages, turn_start)
             if content.strip():
                 config.console.print(Markdown(content))
             elif last:

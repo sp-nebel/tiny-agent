@@ -47,14 +47,16 @@ def _chat_request(payload):
 def call_ollama(messages):
     """Stream a chat turn.
 
-    Returns (content: str, tool_calls: list, cancelled: bool, stats: dict).
-    Exactly one of content/tool_calls is meaningful: a final answer has
-    content and no tool_calls; a tool-calling turn has tool_calls. Reasoning
-    arrives in a separate `thinking` field; it is shown live but never
-    returned, so it is discarded once the answer is rendered. cancelled is
-    True if the user pressed the cancel key (Esc/q) mid-stream; stats is a
-    dict of raw token counters from the final chunk, empty ({}) in that case
-    (the final chunk never arrived) — run_turn sums it across the turn.
+    Returns (content: str, thinking: str, tool_calls: list, cancelled: bool,
+    stats: dict). Exactly one of content/tool_calls is meaningful: a final
+    answer has content and no tool_calls; a tool-calling turn has tool_calls.
+    Reasoning arrives in a separate `thinking` field; it is shown live and now
+    also returned, so run_turn can carry it on the assistant message and feed
+    it back on the next step — keeping the model's chain of thought intact
+    across tool round-trips until a final answer lands. cancelled is True if
+    the user pressed the cancel key (Esc/q) mid-stream; stats is a dict of raw
+    token counters from the final chunk, empty ({}) in that case (the final
+    chunk never arrived) — run_turn sums it across the turn.
     """
     payload = _build_payload(messages, stream=True, tools=True, think=config.THINK)
     req = _chat_request(payload)
@@ -132,7 +134,7 @@ def call_ollama(messages):
                     }
                     break
 
-    return content, tool_calls, cancelled, stats
+    return content, thinking, tool_calls, cancelled, stats
 
 
 def warm_cache(messages=None):
