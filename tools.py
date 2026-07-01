@@ -2,7 +2,6 @@ import os
 import re
 import glob
 import shutil
-import fnmatch
 import difflib
 import subprocess
 
@@ -51,9 +50,43 @@ def show_diff(old: str, new: str, path: str, max_lines: int = 60):
     config.console.print(out, end="")
 
 
-# Matches read_file's "{n:5}  " line-number column (right-justified width 5,
-# two spaces), so edit_file can detect it leaking into old_string.
-_LINE_NUM_PREFIX_RE = re.compile(r"^\s*\d+  ", re.MULTILINE)
+# Matches a candidate line-number prefix loosely enough to find the number;
+# _strip_line_number_prefix then verifies it against read_file's exact
+# "{n:5}  " format before treating it as display metadata.
+_LINE_NUM_CANDIDATE_RE = re.compile(r"^( *)(\d+)  ")
+
+
+def _strip_line_number_prefix(text):
+    """If every line of `text` starts with read_file's exact numbered-line
+    column ("{n:5}  " - right-justified to width 5, then two spaces) and the
+    numbers are consecutive, return `text` with that column removed from
+    every line. Otherwise return None.
+
+    Checking the exact padded format (not just "some digits then two
+    spaces") is what keeps this from misfiring on genuine numeric-prefixed
+    file content like "42  widgets sold" - real column data is very rarely
+    padded to precisely width 5, and single differing lines break both the
+    exact-format check and (for multi-line old_string) the consecutive-number
+    check.
+    """
+    if not text:
+        return None
+    lines = text.splitlines(keepends=True)
+    numbers = []
+    stripped_lines = []
+    for ln in lines:
+        m = _LINE_NUM_CANDIDATE_RE.match(ln)
+        if not m:
+            return None
+        n = int(m.group(2))
+        expected = f"{n:5}  "
+        if not ln.startswith(expected):
+            return None
+        numbers.append(n)
+        stripped_lines.append(ln[len(expected):])
+    if numbers != list(range(numbers[0], numbers[0] + len(numbers))):
+        return None
+    return "".join(stripped_lines)
 
 
 def _cap_output(text, max_chars=None):
@@ -94,10 +127,34 @@ def read_file(path, start=1, end=None):
     if end < start:
         return f"[invalid range: end={end} is before start={start}]"
 
-    body = "".join(f"{n:5}  {ln}" for n, ln in enumerate(lines[start-1:end], start=start))
+    # Cap in whole-line units, not _cap_output's mid-string elision: the
+    # notice below asserts lines start-end are fully present, so eliding the
+    # middle of that range (as a byte-level cap would on long/minified lines)
+    # would make the notice false and the continuation hint unable to
+    # recover what was cut.
+    rendered  = []
+    size      = 0
+    line_note = ""
+    last_line = start - 1
+    for n, ln in enumerate(lines[start-1:end], start=start):
+        piece = f"{n:5}  {ln}"
+        if size + len(piece) > config.MAX_TOOL_OUTPUT_CHARS:
+            if not rendered:
+                # Even a single line blows the budget (e.g. minified code).
+                rendered.append(piece[:config.MAX_TOOL_OUTPUT_CHARS])
+                line_note = f"[line {n} truncated at {config.MAX_TOOL_OUTPUT_CHARS} chars]\n"
+                last_line = n
+            break
+        rendered.append(piece)
+        size += len(piece)
+        last_line = n
+
+    body = "".join(rendered)
     if body and not body.endswith("\n"):
         body += "\n"
-    body = _cap_output(body)
+    body += line_note
+    end = last_line
+
     if end < total:
         # Notice at both ends: small models attend poorly to the tail of a
         # long result, and an imperative is followed better than a hint.
@@ -149,57 +206,25 @@ def grep(pattern, path=".", context=0, before=0, after=0):
     return _cap_output(res) or "[no matches]"
 
 
-def _glob_regex(pattern):
-    """Compile a recursive glob pattern into a regex matched against a path
-    relative to the search base, treating '**' as "zero or more path
-    segments" the same way glob.glob(recursive=True) does — verified against
-    it directly for the documented '**/*.py' / 'src/**/test_*.py' shapes.
-    Each non-'**' segment goes through fnmatch.translate so '*'/'?'/'[...]'
-    still behave per-segment (don't cross '/'), matching glob's own rules.
-    """
-    parts = pattern.split("/")
-    out, i, n = [], 0, len(parts)
-    while i < n:
-        part = parts[i]
-        if part == "**":
-            while i + 1 < n and parts[i + 1] == "**":
-                i += 1
-            out.append(".*" if i + 1 == n else "(?:.*/)?")
-        else:
-            seg = fnmatch.translate(part)
-            out.append(seg[len("(?s:"):-len(r")\Z")])
-            if i + 1 < n and parts[i + 1] != "**":
-                out.append("/")
-        i += 1
-    return re.compile("(?s:" + "".join(out) + r")\Z")
-
-
 def find_files(pattern, path="."):
+    # glob.glob(recursive=True) correctly handles '**' as zero-or-more path
+    # segments (including absolute patterns and '**' embedded in `path`), and
+    # never matches a leading dot — reproducing that by hand (a prior version
+    # of this function did, for a pruned-walk perf win) turned out to diverge
+    # from glob's semantics in several confirmed ways, so this stays on glob.
     base = path or "."
-    out = []
     try:
-        if "**" in pattern:
-            # Walk manually and prune SKIP_DIRS during the walk rather than
-            # glob-then-filter: glob.glob(recursive=True) descends into every
-            # subtree first, so a node_modules or .git dir orders of magnitude
-            # bigger than the rest of the repo gets fully walked regardless.
-            rx = _glob_regex(pattern)
-            for root, dirs, files in os.walk(base):
-                dirs[:] = [d for d in dirs if d not in config.SKIP_DIRS]
-                rel_root = os.path.relpath(root, base)
-                for name in dirs + files:
-                    rel  = name if rel_root in (".", "") else os.path.join(rel_root, name)
-                    full = os.path.normpath(os.path.join(base, rel))
-                    if rx.match(rel):
-                        out.append(full)
-        else:
-            for m in glob.glob(os.path.join(base, pattern)):
-                if not config.SKIP_DIRS.intersection(m.split(os.sep)):
-                    out.append(m)
+        matches = glob.glob(os.path.join(base, pattern), recursive=True)
     except OSError as e:
         return f"[error: {e}]"
 
-    out = [m + ("/" if os.path.isdir(m) else "") for m in sorted(set(out))]
+    out = []
+    for m in sorted(matches):
+        # Drop anything living under a noise dir (any path component matches).
+        if config.SKIP_DIRS.intersection(m.split(os.sep)):
+            continue
+        out.append(m + ("/" if os.path.isdir(m) else ""))
+
     if len(out) > config.MAX_GLOB_HITS:
         out = out[:config.MAX_GLOB_HITS] + [f"[+{len(out) - config.MAX_GLOB_HITS} more]"]
     return _cap_output("\n".join(out)) or "[no matches]"
@@ -267,8 +292,8 @@ def edit_file(path, old_string, new_string, replace_all=False):
         # column into old_string. Detect it and say so directly instead of the
         # generic mismatch message, since "match exactly" alone tends to make
         # the model retry the same mistake with more surrounding lines.
-        stripped = _LINE_NUM_PREFIX_RE.sub("", old_string)
-        if stripped != old_string and content.count(stripped) > 0:
+        stripped = _strip_line_number_prefix(old_string)
+        if stripped is not None and content.count(stripped) > 0:
             return ("[old_string not found - it still has read_file's line-number "
                     "prefix (e.g. '   12  '); that's display metadata, not file "
                     "content. Strip it from the start of each line and try again]")
@@ -301,14 +326,9 @@ def run_cmd(cmd):
     except subprocess.TimeoutExpired:
         return f"[timed out after {config.CMD_TIMEOUT}s]"
     combined = (out.stdout + out.stderr).strip()
-    if len(combined) > config.MAX_CMD_CHARS:
-        # Keep head AND tail: test runners and builds put the failure summary
-        # at the end, and losing it makes the model re-run the command.
-        head = config.MAX_CMD_CHARS // 4
-        tail = config.MAX_CMD_CHARS - head
-        combined = (combined[:head]
-                    + f"\n[… {len(combined) - config.MAX_CMD_CHARS} chars elided …]\n"
-                    + combined[-tail:])
+    # Keep head AND tail: test runners and builds put the failure summary at
+    # the end, and losing it makes the model re-run the command.
+    combined = _cap_output(combined, config.MAX_CMD_CHARS)
     return combined or f"[exit {out.returncode}, no output]"
 
 

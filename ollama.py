@@ -158,6 +158,14 @@ def warm_cache(messages=None):
     try:
         with urllib.request.urlopen(req, timeout=config.STREAM_TIMEOUT) as resp:
             resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        # Same think-unsupported fallback as call_ollama: retry once with it
+        # disabled so the warmup still happens (and the real call downstream
+        # skips the same 400 round-trip) instead of losing the warmup outright.
+        if config.THINK and e.code == 400 and "think" in body.lower():
+            config.THINK = False
+            warm_cache(messages)
     except OSError:
         pass
 

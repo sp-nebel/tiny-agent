@@ -22,8 +22,9 @@ NUM_CTX        = 32768
 # Socket timeout for the streaming /api/chat request — applies per network
 # read, not to the whole generation, so a normal (if slow) CPU decode keeps
 # resetting it as chunks trickle in. Only fires if the connection genuinely
-# hangs with nothing arriving at all.
-STREAM_TIMEOUT = 300
+# hangs with nothing arriving at all. A very slow CPU-only prefill can
+# legitimately take longer than the default; raise via AGENT_STREAM_TIMEOUT.
+STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
 
 # Hard cap on any single tool result (grep/read_file/list_dir/find_files), so
 # one call — a long grep context block, a read_file line hitting minified or
