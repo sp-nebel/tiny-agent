@@ -30,6 +30,13 @@ STEP_LIMIT_NUDGE = (
     "gathered; do not call any more tools.]"
 )
 
+# Appended at the tail when the model returns a wholly empty reply, to give it
+# another swing. Deliberately neutral — an empty turn may just mean the model
+# needs another step (more thinking, or a tool call), so we don't force a final
+# answer; the retry simply re-enters the loop. Tail-only, so the cache is intact.
+EMPTY_RETRY_NUDGE = "[your last reply was empty — please continue.]"
+MAX_EMPTY_RETRIES = 2
+
 
 def trim_history(messages):
     """Collapse old tool outputs in place to conserve the context window.
@@ -84,6 +91,7 @@ def run_turn(messages, max_steps=20):
     turn_stats = {}
     calls = 0
     step = 0
+    empty_retries = 0
     while max_steps <= 0 or step < max_steps:
         trim_history(messages)
         # Last allowed step: force an answer. We keep the tool schemas in the
@@ -120,12 +128,23 @@ def run_turn(messages, max_steps=20):
         messages.append(assistant_msg)
 
         if not keep_tc:
+            # A wholly empty reply (no content, no tools) isn't a real finish —
+            # give the model another swing, up to MAX_EMPTY_RETRIES times, by
+            # appending a neutral nudge and re-entering the loop. Not on the
+            # forced last step (out of budget) and not once the cap is hit.
+            if not content.strip() and not last and empty_retries < MAX_EMPTY_RETRIES:
+                empty_retries += 1
+                messages.append({"role": "user", "content": EMPTY_RETRY_NUDGE})
+                continue
+
             # Final answer (normal early finish, or the forced last step) —
             # render as Markdown, then the turn summary.
             if content.strip():
                 config.console.print(Markdown(content))
-            else:
+            elif last:
                 config.console.print("[yellow]hit step limit; model returned no answer[/yellow]")
+            else:
+                config.console.print("[yellow]model returned an empty answer[/yellow]")
             if turn_stats:
                 config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
             return
@@ -159,6 +178,9 @@ def run_turn(messages, max_steps=20):
                 name = tc.get("function", {}).get("name", "tool")
                 messages.append({"role": "tool", "content": "[interrupted before this tool ran]", "name": name})
 
+        # A productive tool round-trip clears the empty streak, so rare one-off
+        # empties across a long turn don't accumulate toward the cap.
+        empty_retries = 0
         step += 1
 
 # --------------------------------------------------------------------------- #
