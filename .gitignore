@@ -10,13 +10,17 @@ env/
 .Python
 
 # IDE and OS generated files
-.idea/          # PyCharm
-.vscode/        # VS Code settings (if local machine-specific)
-.DS_Store       # macOS artifacts
+# PyCharm
+.idea/
+# VS Code settings (if local machine-specific)
+.vscode/
+# macOS artifacts
+.DS_Store
 
 # Local development and agent caches
-.claude/        # Directory seen in listing
-__pycache__/    # Python cache directory
+.claude/
+# Python cache directory
+__pycache__/
 
 # Compiled files (e.g., if using a build system later)
 build/

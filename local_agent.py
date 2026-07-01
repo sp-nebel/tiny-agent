@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mini-agent — a minimal local coding agent for CPU-bound Ollama models.
+tiny-agent — a minimal local coding agent for CPU-bound Ollama models.
 
 Built around the constraint that matters on a no-GPU laptop: prefill is
 expensive, so the whole design is about minimising and reusing prefilled tokens.
@@ -26,12 +26,14 @@ Design decisions (the "why" behind the code):
      dumping a 400-line service class into the context window.
 
 Usage:
-    python mini_agent.py "review the null handling in AuthService"
-    python mini_agent.py            # interactive; seed a task at the prompt
+    python local_agent.py "review the null handling in AuthService"
+    python local_agent.py            # interactive; seed a task at the prompt
 
 Env vars:
-    AGENT_MODEL   (default: gemma4:latest)   — any Ollama model with tool support
-    OLLAMA_URL    (default: http://localhost:11434)
+    AGENT_MODEL           (default: gemma4:12b-it-qat)   — any Ollama model with tool support
+    OLLAMA_URL            (default: http://localhost:11434)
+    AGENT_THINK           (default: 1) — set to 0 to disable reasoning output
+    AGENT_SUMMARIZE_TRIM  (default: 1) — set to 0 to elide trimmed tool outputs instead of summarizing them
 
 Dependency: pip install rich
 Note: ensure Ollama >= 0.20.2 for reliable Gemma 4 tool-call parsing.
@@ -76,7 +78,7 @@ from rich.text import Text
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 MODEL       = os.environ.get("AGENT_MODEL", "gemma4:12b-it-qat")
 
-SESSION_DIR = os.path.expanduser("~/.mini_agent_sessions")
+SESSION_DIR = os.path.expanduser("~/.tiny_agent_sessions")
 
 MAX_READ_LINES = 100
 MAX_GREP_HITS  = 20
@@ -905,8 +907,8 @@ def trim_history(messages):
     TRIM_PREFIX and skipped on later passes (a length check no longer suffices,
     since a digest can be longer than TRIM_MIN_CHARS).
     """
-    approx_tokens = sum(len(m.get("content") or "") for m in messages) // 4
-    if approx_tokens < TRIM_AT_TOKENS:
+    total_tokens = sum(len(m.get("content") or "") for m in messages) // 4
+    if total_tokens < TRIM_AT_TOKENS:
         return
     task = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
     tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
@@ -1032,7 +1034,7 @@ def main():
     # Persistent prompt history: importing readline upgrades input() in place,
     # so console.input gets line editing and up-arrow recall for free.
     if readline:
-        histfile = os.path.expanduser("~/.mini_agent_history")
+        histfile = os.path.expanduser("~/.tiny_agent_history")
         with contextlib.suppress(OSError):
             readline.read_history_file(histfile)
         readline.set_history_length(500)
@@ -1086,7 +1088,7 @@ def main():
         # first message to `messages` before this thread's request goes out.
         threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
 
-    console.print(f"[bold]mini-agent[/bold] · {MODEL} · {os.getcwd()}")
+    console.print(f"[bold]tiny-agent[/bold] · {MODEL} · {os.getcwd()}")
     console.print(
         "[dim]model warms up in the background; the first reply is slow if it "
         "hasn't finished. later turns reuse the KV cache. press Esc/q to "

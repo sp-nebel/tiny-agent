@@ -1,7 +1,7 @@
 >[!WARNING]
 >Only vibecoding ahead
 
-# mini-agent
+# tiny-agent
 
 A minimal local coding agent for CPU-bound machines, built around [Ollama](https://ollama.com).
 
@@ -12,13 +12,13 @@ The whole design is shaped by one constraint: **no GPU**. Prefill is expensive o
 - Python 3.8+
 - [Ollama](https://ollama.com) ≥ 0.20.2
 - `pip install rich`
-- A model with tool-call support pulled in Ollama (default: `gemma4:latest`)
+- A model with tool-call support pulled in Ollama (default: `gemma4:12b-it-qat`)
 
 ## Setup
 
 ```bash
 pip install rich
-ollama pull gemma4:latest   # or any tool-capable model
+ollama pull gemma4:12b-it-qat   # or any tool-capable model
 ```
 
 ## Usage
@@ -35,15 +35,16 @@ python local_agent.py
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model TAG` | `gemma4:latest` | Ollama model tag |
+| `--model TAG` | `gemma4:12b-it-qat` | Ollama model tag |
 | `--yes` | off | Auto-approve all writes and shell commands |
 | `--max-steps N` | 20 | Max tool calls before giving up on a task |
+| `--resume [NAME]` | off | Resume a saved session by name; bare `--resume` resumes the most recent |
 
 ### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AGENT_MODEL` | `gemma4:latest` | Ollama model tag (overridden by `--model`) |
+| `AGENT_MODEL` | `gemma4:12b-it-qat` | Ollama model tag (overridden by `--model`) |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API base URL |
 | `AGENT_THINK` | `1` | Set to `0` to disable reasoning output |
 | `AGENT_SUMMARIZE_TRIM` | `1` | Set to `0` to elide trimmed tool outputs instead of summarizing them |
@@ -54,8 +55,11 @@ python local_agent.py
 |-------|--------|
 | `exit` / `quit` | Quit the agent |
 | `/clear` or `clear` | Reset conversation history (system prompt and tool schemas stay cached) |
+| `/save [NAME]` | Save the current conversation as a session (defaults to a timestamp) |
+| `/resume [NAME]` | Resume a saved session; bare `/resume` resumes the most recent |
+| `/sessions` | List saved sessions |
 | Esc / `q` / `Q` during a reply | Cancel the in-flight response |
-| Up / Down arrows | Recall previous prompts (history persists in `~/.mini_agent_history`) |
+| Up / Down arrows | Recall previous prompts (history persists in `~/.tiny_agent_history`) |
 
 ## Tools available to the model
 
