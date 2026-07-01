@@ -38,6 +38,24 @@ EMPTY_RETRY_NUDGE = "[your last reply was empty — please continue.]"
 MAX_EMPTY_RETRIES = 2
 
 
+def _msg_tokens(m):
+    """Token estimate for one message, including the fields that actually
+    ride along in the request body — not just `content`. `thinking` is fed
+    back across a turn's tool round-trips (see run_turn) and `tool_calls` is
+    serialized JSON, so a content-only count understates the real prefill and
+    lets the window overflow silently (Ollama then drops the front of the
+    prompt — the system prompt — and every call re-prefills from scratch)."""
+    n = len(m.get("content") or "") + len(m.get("thinking") or "")
+    tool_calls = m.get("tool_calls")
+    if tool_calls:
+        n += len(json.dumps(tool_calls))
+    return n // 4
+
+
+def _total_tokens(messages):
+    return sum(_msg_tokens(m) for m in messages)
+
+
 def trim_history(messages):
     """Collapse old tool outputs in place to conserve the context window.
 
@@ -48,7 +66,7 @@ def trim_history(messages):
     keep-window in one pass. One cache bust per long session, not one per step.
 
     The token estimate uses the ~4 chars/token heuristic; it only needs to be
-    right to within the 30% headroom left below NUM_CTX.
+    right to within the headroom left below NUM_CTX.
 
     When SUMMARIZE_ON_TRIM is set, each collapsed output is first run through
     summarize_output (a fresh session on the same model) so the kept stub is an
@@ -59,28 +77,49 @@ def trim_history(messages):
     Idempotent by construction: every collapsed message is prefixed with
     TRIM_PREFIX and skipped on later passes (a length check no longer suffices,
     since a digest can be longer than TRIM_MIN_CHARS).
+
+    After collapsing eligible tool outputs, a backstop hard-truncates any
+    remaining oversized message outside a protected recent tail. Tool-output
+    collapsing alone can't help when the bloat is in long assistant/user
+    messages, or when the keep-window itself is what's oversized — without
+    this, those cases silently overflow NUM_CTX.
     """
-    total_tokens = sum(len(m.get("content") or "") for m in messages) // 4
-    if total_tokens < config.TRIM_AT_TOKENS:
+    if _total_tokens(messages) < config.TRIM_AT_TOKENS:
         return
-    task = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    task = next((m["content"] for m in reversed(messages)
+                 if m.get("role") == "user"
+                 and m.get("content") not in (STEP_LIMIT_NUDGE, EMPTY_RETRY_NUDGE)), "")
     tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     old = tool_idxs[:-config.KEEP_FULL_TOOL_RESULTS] if config.KEEP_FULL_TOOL_RESULTS else tool_idxs
     targets = [i for i in old
                if not (messages[i].get("content") or "").startswith(config.TRIM_PREFIX)
                and len(messages[i].get("content") or "") > config.TRIM_MIN_CHARS]
-    if not targets:
+    if targets:
+        config.console.print(f"[dim]compacting {len(targets)} old tool output"
+                      f"{'s' if len(targets) != 1 else ''}…[/dim]")
+        for i in targets:
+            m       = messages[i]
+            content = m.get("content", "")
+            name    = m.get("name", "tool")
+            nlines  = content.count("\n") + 1
+            marker  = f"{config.TRIM_PREFIX}{name} — was {nlines} lines, {len(content)} chars]"
+            summary = summarize_output(name, content, task) if config.SUMMARIZE_ON_TRIM else None
+            m["content"] = f"{marker}\n{summary}" if summary else marker
+
+    if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:
         return
-    config.console.print(f"[dim]compacting {len(targets)} old tool output"
-                  f"{'s' if len(targets) != 1 else ''}…[/dim]")
-    for i in targets:
-        m       = messages[i]
-        content = m.get("content", "")
-        name    = m.get("name", "tool")
-        nlines  = content.count("\n") + 1
-        marker  = f"{config.TRIM_PREFIX}{name} — was {nlines} lines, {len(content)} chars]"
-        summary = summarize_output(name, content, task) if config.SUMMARIZE_ON_TRIM else None
-        m["content"] = f"{marker}\n{summary}" if summary else marker
+    protected = set(range(max(0, len(messages) - config.KEEP_RECENT_MESSAGES), len(messages)))
+    protected.add(0)   # system prompt
+    for i, m in enumerate(messages):
+        if i in protected:
+            continue
+        content = m.get("content") or ""
+        if len(content) <= config.TRIM_MIN_CHARS or content.startswith(config.TRIM_PREFIX):
+            continue
+        m["content"] = (content[:config.TRIM_MIN_CHARS]
+                         + f"\n{config.TRIM_PREFIX}hard-truncated, was {len(content)} chars]")
+        if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:
+            break
 
 
 def drop_thinking(messages, start):
@@ -97,6 +136,28 @@ def drop_thinking(messages, start):
     for m in messages[start:]:
         if m.get("role") == "assistant":
             m.pop("thinking", None)
+
+
+def strip_nudges(messages, start):
+    """Remove step-limit/empty-retry nudges and the empty assistant replies
+    that prompted them from `start` onward, once the turn has its real
+    answer. They're single-purpose "try again" prompts for getting the model
+    unstuck mid-turn; left in place they persist into later turns and saved
+    sessions as stray "[your last reply was empty...]" filler — and the
+    summarizer can even be handed one as "the task" if trim_history runs
+    before this. Edits committed history, so — like drop_thinking — this
+    busts the KV cache, paid once at the same turn boundary drop_thinking
+    already busts it at.
+    """
+    keep = messages[:start]
+    for m in messages[start:]:
+        if m.get("role") == "user" and m.get("content") in (STEP_LIMIT_NUDGE, EMPTY_RETRY_NUDGE):
+            continue
+        if (m.get("role") == "assistant" and not (m.get("content") or "").strip()
+                and not m.get("tool_calls")):
+            continue
+        keep.append(m)
+    messages[:] = keep
 
 
 def run_turn(messages, max_steps=20):
@@ -128,6 +189,7 @@ def run_turn(messages, max_steps=20):
             # to history) and hand control back to the prompt. The turn is over,
             # so shed the reasoning fed back on earlier steps too.
             drop_thinking(messages, turn_start)
+            strip_nudges(messages, turn_start)
             config.console.print("[yellow]cancelled[/yellow]")
             return
 
@@ -168,6 +230,7 @@ def run_turn(messages, max_steps=20):
             # the turn is done, so shed the reasoning we fed back across its
             # steps, then render as Markdown and the turn summary.
             drop_thinking(messages, turn_start)
+            strip_nudges(messages, turn_start)
             if content.strip():
                 config.console.print(Markdown(content))
             elif last:
@@ -271,12 +334,6 @@ def main():
         else:
             config.console.print("[yellow]no matching session; starting fresh[/yellow]")
 
-    # cwd injected into the FIRST user message only — keeps the system prompt
-    # byte-identical across projects so the prefix cache hits every session.
-    # (For a resumed session first_user_msg is already False, so this is only
-    # ever used for a fresh one — computed after any resume-triggered chdir.)
-    cwd_context = f"Working directory: {os.getcwd()}\n\n"
-
     initial = " ".join(args.prompt).strip()
 
     # Interactive start: prefill the static prefix — or, if a session was just
@@ -359,7 +416,7 @@ def main():
                     save_session(session_name, messages)
             try:
                 data = load_session(new_name)
-                apply_session(messages, data)
+                apply_session(messages, data, args.model)
             except (OSError, ValueError, KeyError, TypeError):
                 config.console.print("[yellow]could not read session; conversation unchanged[/yellow]\n")
                 continue
@@ -371,7 +428,12 @@ def main():
         if not user:
             continue
 
-        content        = (cwd_context + user) if first_user_msg else user
+        # cwd injected into the FIRST user message only — keeps the system
+        # prompt byte-identical across projects so the prefix cache hits every
+        # session. Computed here, not once at startup, so a `cd` tool call or
+        # a `/clear` (which resets first_user_msg) picks up the current
+        # directory instead of whatever it was when the process started.
+        content        = (f"Working directory: {os.getcwd()}\n\n" + user) if first_user_msg else user
         first_user_msg = False
         messages.append({"role": "user", "content": content})
 

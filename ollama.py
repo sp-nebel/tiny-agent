@@ -69,7 +69,7 @@ def call_ollama(messages):
     last_paint = 0.0
 
     try:
-        resp = urllib.request.urlopen(req)
+        resp = urllib.request.urlopen(req, timeout=config.STREAM_TIMEOUT)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         # Model doesn't support the `think` parameter — disable and retry once
@@ -146,15 +146,17 @@ def warm_cache(messages=None):
     real turn only prefills the newly-typed user message.
 
     Options must match call_ollama exactly — a different num_ctx would make
-    Ollama reload the model and waste the warmup. Failures are ignored; the
-    real call will surface them.
+    Ollama reload the model, and a different `think` would make it render a
+    different prompt template, both wasting the warmup by prefilling a prefix
+    the real call won't reuse. Failures are ignored; the real call will
+    surface them.
     """
     if messages is None:
         messages = [{"role": "system", "content": config.SYSTEM}]
-    payload = _build_payload(messages, stream=False, tools=True, num_predict=1)
+    payload = _build_payload(messages, stream=False, tools=True, think=config.THINK, num_predict=1)
     req = _chat_request(payload)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=config.STREAM_TIMEOUT) as resp:
             resp.read()
     except OSError:
         pass

@@ -14,9 +14,22 @@ SESSION_DIR = os.path.expanduser("~/.tiny_agent_sessions")
 MAX_READ_LINES = 100
 MAX_GREP_HITS  = 20
 MAX_GLOB_HITS  = 20
+MAX_LIST_HITS  = 200
 MAX_CMD_CHARS  = 8000
 CMD_TIMEOUT    = 120
 NUM_CTX        = 32768
+
+# Socket timeout for the streaming /api/chat request — applies per network
+# read, not to the whole generation, so a normal (if slow) CPU decode keeps
+# resetting it as chunks trickle in. Only fires if the connection genuinely
+# hangs with nothing arriving at all.
+STREAM_TIMEOUT = 300
+
+# Hard cap on any single tool result (grep/read_file/list_dir/find_files), so
+# one call — a long grep context block, a read_file line hitting minified or
+# generated code — can't dump an outsized chunk into the context window in a
+# single shot. Same head+tail-keeping shape as run_cmd's existing cap.
+MAX_TOOL_OUTPUT_CHARS = 8000
 
 # History trimming: when the conversation approaches the context window,
 # collapse all but the N most recent tool outputs to a one-line stub. Editing
@@ -26,6 +39,14 @@ NUM_CTX        = 32768
 KEEP_FULL_TOOL_RESULTS = 3
 TRIM_MIN_CHARS         = 400
 TRIM_AT_TOKENS         = int(NUM_CTX * 0.7)
+
+# Backstop for when collapsing eligible tool outputs still isn't enough (e.g.
+# bloat from long assistant/user messages, or the keep-window itself is
+# oversized): hard-truncate remaining oversized messages outside a protected
+# recent-message tail so the prompt can never silently exceed NUM_CTX and
+# push the system prompt out the front of Ollama's context.
+HARD_TRUNCATE_AT_TOKENS = int(NUM_CTX * 0.9)
+KEEP_RECENT_MESSAGES    = 6
 
 # Summarize-on-trim: when trim_history collapses an old tool output, instead of
 # discarding it to a one-line stub, spawn a fresh empty Ollama session (same
@@ -75,6 +96,10 @@ small range will do. Make one tool call at a time and wait for its result.
 Bracketed lines like [lines 1-100 of 543] in tool results are metadata from
 the tool, not file content. If a read was truncated and you need more of the
 file, call read_file again with the start value the notice gives you.
+
+read_file output is line-numbered for your reference only (e.g. "   12  foo").
+That number and the two spaces after it are not part of the file — never
+include them in edit_file's old_string, or the match will fail.
 
 When the task is done, reply in Markdown with no tool call."""
 
@@ -181,10 +206,12 @@ TOOL_SCHEMAS = [
             "description": (
                 "Edit a file by replacing an exact string. old_string must match "
                 "the file byte-for-byte (whitespace included) and be unique, "
-                "unless replace_all is true. To CREATE a new file, pass an empty "
-                "old_string and the full contents in new_string. Prefer a small, "
-                "uniquely-identifying old_string over a large one. "
-                "Will ask the user for confirmation."
+                "unless replace_all is true. Do NOT include read_file's line-number "
+                "column (e.g. '   12  ') in old_string - that is display metadata, "
+                "not file content, and including it will make the match fail. "
+                "To CREATE a new file, pass an empty old_string and the full "
+                "contents in new_string. Prefer a small, uniquely-identifying "
+                "old_string over a large one. Will ask the user for confirmation."
             ),
             "parameters": {
                 "type": "object",

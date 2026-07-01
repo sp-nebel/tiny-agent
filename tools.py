@@ -1,6 +1,8 @@
 import os
+import re
 import glob
 import shutil
+import fnmatch
 import difflib
 import subprocess
 
@@ -49,6 +51,27 @@ def show_diff(old: str, new: str, path: str, max_lines: int = 60):
     config.console.print(out, end="")
 
 
+# Matches read_file's "{n:5}  " line-number column (right-justified width 5,
+# two spaces), so edit_file can detect it leaking into old_string.
+_LINE_NUM_PREFIX_RE = re.compile(r"^\s*\d+  ", re.MULTILINE)
+
+
+def _cap_output(text, max_chars=None):
+    """Hard cap on a tool result's size, independent of any hit/line count
+    the caller already applies. A single grep context block or a read_file
+    line hitting minified/generated code can blow past those counts while
+    staying well under them in item count, so this is a byte-level backstop.
+    Keeps head and tail, like run_cmd's cap, since the useful part (a match,
+    an error) can land at either end.
+    """
+    max_chars = max_chars or config.MAX_TOOL_OUTPUT_CHARS
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 4
+    tail = max_chars - head
+    return (text[:head] + f"\n[… {len(text) - max_chars} chars elided …]\n" + text[-tail:])
+
+
 def read_file(path, start=1, end=None):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -74,6 +97,7 @@ def read_file(path, start=1, end=None):
     body = "".join(f"{n:5}  {ln}" for n, ln in enumerate(lines[start-1:end], start=start))
     if body and not body.endswith("\n"):
         body += "\n"
+    body = _cap_output(body)
     if end < total:
         # Notice at both ends: small models attend poorly to the tail of a
         # long result, and an imperative is followed better than a hint.
@@ -108,30 +132,77 @@ def grep(pattern, path=".", context=0, before=0, after=0):
     # (bad regex, unreadable path). Don't let an error message pass as hits.
     if out.returncode > 1:
         return f"[grep error: {out.stderr.strip() or f'exit {out.returncode}'}]"
-    res   = out.stdout.strip()
-    hits  = res.splitlines()
-    if len(hits) > config.MAX_GREP_HITS:
-        res = "\n".join(hits[:config.MAX_GREP_HITS]) + f"\n[+{len(hits) - config.MAX_GREP_HITS} more matches]"
-    return res or "[no matches]"
+    res = out.stdout.strip()
+    # With -A/-B/-C, rg and grep separate non-adjacent match groups with a
+    # standalone "--" line, so counting raw lines against MAX_GREP_HITS caps
+    # on far fewer real matches than the number implies (a context=3 hit is
+    # 7 lines). Cap by match group instead when context is in play.
+    if context or before or after:
+        blocks = res.split("\n--\n") if res else []
+        if len(blocks) > config.MAX_GREP_HITS:
+            blocks = blocks[:config.MAX_GREP_HITS] + [f"[+{len(blocks) - config.MAX_GREP_HITS} more matches]"]
+        res = "\n--\n".join(blocks)
+    else:
+        hits = res.splitlines()
+        if len(hits) > config.MAX_GREP_HITS:
+            res = "\n".join(hits[:config.MAX_GREP_HITS]) + f"\n[+{len(hits) - config.MAX_GREP_HITS} more matches]"
+    return _cap_output(res) or "[no matches]"
+
+
+def _glob_regex(pattern):
+    """Compile a recursive glob pattern into a regex matched against a path
+    relative to the search base, treating '**' as "zero or more path
+    segments" the same way glob.glob(recursive=True) does — verified against
+    it directly for the documented '**/*.py' / 'src/**/test_*.py' shapes.
+    Each non-'**' segment goes through fnmatch.translate so '*'/'?'/'[...]'
+    still behave per-segment (don't cross '/'), matching glob's own rules.
+    """
+    parts = pattern.split("/")
+    out, i, n = [], 0, len(parts)
+    while i < n:
+        part = parts[i]
+        if part == "**":
+            while i + 1 < n and parts[i + 1] == "**":
+                i += 1
+            out.append(".*" if i + 1 == n else "(?:.*/)?")
+        else:
+            seg = fnmatch.translate(part)
+            out.append(seg[len("(?s:"):-len(r")\Z")])
+            if i + 1 < n and parts[i + 1] != "**":
+                out.append("/")
+        i += 1
+    return re.compile("(?s:" + "".join(out) + r")\Z")
 
 
 def find_files(pattern, path="."):
     base = path or "."
+    out = []
     try:
-        matches = glob.glob(os.path.join(base, pattern), recursive=True)
+        if "**" in pattern:
+            # Walk manually and prune SKIP_DIRS during the walk rather than
+            # glob-then-filter: glob.glob(recursive=True) descends into every
+            # subtree first, so a node_modules or .git dir orders of magnitude
+            # bigger than the rest of the repo gets fully walked regardless.
+            rx = _glob_regex(pattern)
+            for root, dirs, files in os.walk(base):
+                dirs[:] = [d for d in dirs if d not in config.SKIP_DIRS]
+                rel_root = os.path.relpath(root, base)
+                for name in dirs + files:
+                    rel  = name if rel_root in (".", "") else os.path.join(rel_root, name)
+                    full = os.path.normpath(os.path.join(base, rel))
+                    if rx.match(rel):
+                        out.append(full)
+        else:
+            for m in glob.glob(os.path.join(base, pattern)):
+                if not config.SKIP_DIRS.intersection(m.split(os.sep)):
+                    out.append(m)
     except OSError as e:
         return f"[error: {e}]"
 
-    out = []
-    for m in sorted(matches):
-        # Drop anything living under a noise dir (any path component matches).
-        if config.SKIP_DIRS.intersection(m.split(os.sep)):
-            continue
-        out.append(m + ("/" if os.path.isdir(m) else ""))
-
+    out = [m + ("/" if os.path.isdir(m) else "") for m in sorted(set(out))]
     if len(out) > config.MAX_GLOB_HITS:
         out = out[:config.MAX_GLOB_HITS] + [f"[+{len(out) - config.MAX_GLOB_HITS} more]"]
-    return "\n".join(out) or "[no matches]"
+    return _cap_output("\n".join(out)) or "[no matches]"
 
 
 def list_dir(path="."):
@@ -139,8 +210,15 @@ def list_dir(path="."):
         entries = sorted(os.listdir(path))
     except OSError as e:
         return f"[error: {e}]"
+    if len(entries) > config.MAX_LIST_HITS:
+        hidden  = len(entries) - config.MAX_LIST_HITS
+        entries = entries[:config.MAX_LIST_HITS]
+    else:
+        hidden = 0
     lines = [e + ("/" if os.path.isdir(os.path.join(path, e)) else "") for e in entries]
-    return "\n".join(lines) or "[empty]"
+    if hidden:
+        lines.append(f"[+{hidden} more]")
+    return _cap_output("\n".join(lines)) or "[empty]"
 
 
 def cd(path):
@@ -185,6 +263,15 @@ def edit_file(path, old_string, new_string, replace_all=False):
 
     count = content.count(old_string)
     if count == 0:
+        # Common small-model failure: copying read_file's "   12  " line-number
+        # column into old_string. Detect it and say so directly instead of the
+        # generic mismatch message, since "match exactly" alone tends to make
+        # the model retry the same mistake with more surrounding lines.
+        stripped = _LINE_NUM_PREFIX_RE.sub("", old_string)
+        if stripped != old_string and content.count(stripped) > 0:
+            return ("[old_string not found - it still has read_file's line-number "
+                    "prefix (e.g. '   12  '); that's display metadata, not file "
+                    "content. Strip it from the start of each line and try again]")
         return "[old_string not found; it must match the file exactly, whitespace included]"
     if count > 1 and not replace_all:
         return (f"[old_string matches {count} times; add surrounding context to "
