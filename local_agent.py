@@ -76,6 +76,8 @@ from rich.text import Text
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 MODEL       = os.environ.get("AGENT_MODEL", "gemma4:12b-it-qat")
 
+SESSION_DIR = os.path.expanduser("~/.mini_agent_sessions")
+
 MAX_READ_LINES = 100
 MAX_GREP_HITS  = 20
 MAX_GLOB_HITS  = 20
@@ -714,18 +716,23 @@ def call_ollama(messages):
     return content, tool_calls, cancelled, stats
 
 
-def warm_cache():
-    """Prefill the static prefix (system prompt + tool schemas) in the
-    background so the model is loaded and the KV cache is warm by the time the
-    user finishes typing their first prompt.
+def warm_cache(messages=None):
+    """Prefill a message prefix in the background so the model is loaded and
+    the KV cache is warm by the time it's needed for a real turn.
+
+    Defaults to just the static system prompt (the cold-start case). Passing
+    the full restored history after a resume warms that instead, so the next
+    real turn only prefills the newly-typed user message.
 
     Options must match call_ollama exactly — a different num_ctx would make
     Ollama reload the model and waste the warmup. Failures are ignored; the
     real call will surface them.
     """
+    if messages is None:
+        messages = [{"role": "system", "content": SYSTEM}]
     payload = {
         "model":      MODEL,
-        "messages":   [{"role": "system", "content": SYSTEM}],
+        "messages":   messages,
         "tools":      TOOL_SCHEMAS,
         "stream":     False,
         "keep_alive": "30m",
@@ -782,6 +789,64 @@ def summarize_output(tool_name, content, task):
         return None
     text = (obj.get("message") or {}).get("content", "").strip()
     return text or None
+
+# --------------------------------------------------------------------------- #
+# Session persistence (pause/resume a conversation across process restarts)
+# --------------------------------------------------------------------------- #
+
+def default_ts_name():
+    return time.strftime("%Y-%m-%dT%H-%M")
+
+
+def session_path(name):
+    return os.path.join(SESSION_DIR, os.path.basename(name) + ".json")
+
+
+def save_session(name, messages):
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    data = {
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "model":    MODEL,
+        "cwd":      os.getcwd(),
+        "messages": messages,
+    }
+    with open(session_path(name), "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+def load_session(name):
+    with open(session_path(name), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def list_sessions():
+    """Saved session file paths, newest-modified first."""
+    files = glob.glob(os.path.join(SESSION_DIR, "*.json"))
+    return sorted(files, key=os.path.getmtime, reverse=True)
+
+
+def resolve_session(name):
+    """name -> file path. Empty/None picks the most-recently-modified session.
+    Returns None if nothing matches."""
+    if name:
+        p = session_path(name)
+        return p if os.path.exists(p) else None
+    files = list_sessions()
+    return files[0] if files else None
+
+
+def apply_session(messages, data, model_override=None):
+    """Restore a loaded session dict into the live `messages` list.
+
+    Mutates `messages` in place (`messages[:] = ...`) rather than rebinding it,
+    so closures that captured the list — like the autosave handler — keep
+    seeing the live conversation.
+    """
+    global MODEL
+    messages[:] = data["messages"]
+    with contextlib.suppress(OSError):
+        os.chdir(data["cwd"])
+    MODEL = model_override if model_override else data.get("model", MODEL)
 
 # --------------------------------------------------------------------------- #
 # Display helpers
@@ -953,12 +1018,15 @@ def main():
 
     ap = argparse.ArgumentParser(description="Minimal local coding agent over Ollama.")
     ap.add_argument("prompt",      nargs="*",      help="initial task (optional)")
-    ap.add_argument("--model",     default=MODEL,  help=f"Ollama model tag (default: {MODEL})")
+    ap.add_argument("--model",     default=None,   help=f"Ollama model tag (default: {MODEL}, or the saved model when resuming)")
     ap.add_argument("--yes",       action="store_true", help="auto-approve writes and commands")
     ap.add_argument("--max-steps", type=int, default=20, help="max tool calls per task")
+    ap.add_argument("--resume",    nargs="?", const="", default=None,
+                     help="resume a saved session by name; bare --resume resumes the most recent")
     args = ap.parse_args()
 
-    MODEL    = args.model
+    if args.model:
+        MODEL = args.model
     AUTO_YES = args.yes
 
     # Persistent prompt history: importing readline upgrades input() in place,
@@ -974,25 +1042,57 @@ def main():
                 readline.write_history_file(histfile)
         atexit.register(save_history)
 
-    messages = [{"role": "system", "content": SYSTEM}]
+    messages       = [{"role": "system", "content": SYSTEM}]
+    first_user_msg = True
+    session_name   = None
+
+    def autosave():
+        # Skip a system-prompt-only conversation so exits without real work
+        # don't litter the session store.
+        if len(messages) > 1:
+            with contextlib.suppress(OSError):
+                save_session(session_name or default_ts_name(), messages)
+    atexit.register(autosave)
+
+    if args.resume is not None:
+        path = resolve_session(args.resume)
+        if path:
+            name = os.path.splitext(os.path.basename(path))[0]
+            try:
+                data = load_session(name)
+                apply_session(messages, data, args.model)
+                session_name   = name
+                first_user_msg = False
+                console.print(f"[dim]resumed session '{name}' ({len(messages)} messages)[/dim]")
+            except (OSError, ValueError, KeyError, TypeError):
+                console.print("[yellow]could not read session; starting fresh[/yellow]")
+        else:
+            console.print("[yellow]no matching session; starting fresh[/yellow]")
+
     # cwd injected into the FIRST user message only — keeps the system prompt
     # byte-identical across projects so the prefix cache hits every session.
-    cwd_context    = f"Working directory: {os.getcwd()}\n\n"
-    first_user_msg = True
+    # (For a resumed session first_user_msg is already False, so this is only
+    # ever used for a fresh one — computed after any resume-triggered chdir.)
+    cwd_context = f"Working directory: {os.getcwd()}\n\n"
 
     initial = " ".join(args.prompt).strip()
 
-    # Interactive start: prefill the static prefix while the user types their
-    # first prompt. With an argv prompt the real request follows immediately,
-    # so a warmup would just queue ahead of it for no gain.
+    # Interactive start: prefill the static prefix — or, if a session was just
+    # restored, the full restored history — while the user types their first
+    # prompt. With an argv prompt the real request follows immediately, so a
+    # warmup would just queue ahead of it for no gain.
     if not initial:
-        threading.Thread(target=warm_cache, daemon=True).start()
+        # A snapshot, not the live list: the main loop may append the user's
+        # first message to `messages` before this thread's request goes out.
+        threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
 
     console.print(f"[bold]mini-agent[/bold] · {MODEL} · {os.getcwd()}")
     console.print(
         "[dim]model warms up in the background; the first reply is slow if it "
         "hasn't finished. later turns reuse the KV cache. press Esc/q to "
-        "cancel a reply, '/clear' to reset context, 'exit' to quit.[/dim]\n"
+        "cancel a reply, '/clear' to reset context, '/save', '/resume', "
+        "'/sessions' to pause/switch conversations (each takes an optional "
+        "name), 'exit' to quit.[/dim]\n"
     )
 
     while True:
@@ -1018,6 +1118,53 @@ def main():
             del messages[1:]
             first_user_msg = True
             console.print("[dim]context cleared (system prompt preserved)[/dim]\n")
+            continue
+        if user.lower() == "/sessions":
+            files = list_sessions()
+            if not files:
+                console.print("[dim]no saved sessions[/dim]\n")
+                continue
+            for f in files:
+                name = os.path.splitext(os.path.basename(f))[0]
+                try:
+                    with open(f, "r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                marker = " [bold]*[/bold]" if name == session_name else ""
+                n        = len(meta.get("messages", []))
+                saved_at = meta.get("saved_at", "?")
+                console.print(f"[dim]{name}{marker} — {saved_at} · {n} messages[/dim]")
+            console.print()
+            continue
+        if user.lower() == "/save" or user.lower().startswith("/save "):
+            arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
+            name = arg_name or session_name or default_ts_name()
+            save_session(name, messages)
+            session_name = name
+            console.print(f"[dim]saved session '{name}'[/dim]\n")
+            continue
+        if user.lower() == "/resume" or user.lower().startswith("/resume "):
+            arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
+            path = resolve_session(arg_name)
+            if not path:
+                console.print("[yellow]no matching session; conversation unchanged[/yellow]\n")
+                continue
+            new_name = os.path.splitext(os.path.basename(path))[0]
+            # Switching away from a named, non-empty session shouldn't lose it.
+            if session_name and len(messages) > 1:
+                with contextlib.suppress(OSError):
+                    save_session(session_name, messages)
+            try:
+                data = load_session(new_name)
+                apply_session(messages, data)
+            except (OSError, ValueError, KeyError, TypeError):
+                console.print("[yellow]could not read session; conversation unchanged[/yellow]\n")
+                continue
+            session_name   = new_name
+            first_user_msg = False
+            console.print(f"[dim]resumed session '{new_name}' ({len(messages)} messages)[/dim]\n")
+            threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
             continue
         if not user:
             continue
