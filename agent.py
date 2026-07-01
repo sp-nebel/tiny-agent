@@ -1,0 +1,336 @@
+import os
+import json
+import atexit
+import argparse
+import threading
+import contextlib
+import urllib.error
+
+from rich.markdown import Markdown
+
+import config
+from tools import dispatch
+from ollama import call_ollama, warm_cache, summarize_output
+from ui import read_prompt, fmt_args, truncate, fmt_stats
+from session import *
+
+try:                      # line editing + history for the interactive prompt
+    import readline
+except ImportError:
+    readline = None
+
+# --------------------------------------------------------------------------- #
+# Agent loop
+# --------------------------------------------------------------------------- #
+
+# Appended at the tail on the final allowed step to force a closing answer
+# instead of yet another tool call. Tail-only, so the prefix cache is untouched.
+STEP_LIMIT_NUDGE = (
+    "[step limit reached — give your best final answer now using what you've "
+    "gathered; do not call any more tools.]"
+)
+
+
+def trim_history(messages):
+    """Collapse old tool outputs in place to conserve the context window.
+
+    Untouched history is free: it sits in the KV prefix cache and is never
+    re-prefilled. Editing a message, by contrast, invalidates the cache from
+    the edit point on. So trimming is lazy — do nothing until the conversation
+    approaches the context window, then collapse every tool result outside the
+    keep-window in one pass. One cache bust per long session, not one per step.
+
+    The token estimate uses the ~4 chars/token heuristic; it only needs to be
+    right to within the 30% headroom left below NUM_CTX.
+
+    When SUMMARIZE_ON_TRIM is set, each collapsed output is first run through
+    summarize_output (a fresh session on the same model) so the kept stub is an
+    informative digest rather than a bare "[elided]" line. That fires a burst of
+    summarizer calls, but only here — at the already-expensive trim moment — so
+    short sessions pay nothing. On failure it falls back to the plain stub.
+
+    Idempotent by construction: every collapsed message is prefixed with
+    TRIM_PREFIX and skipped on later passes (a length check no longer suffices,
+    since a digest can be longer than TRIM_MIN_CHARS).
+    """
+    total_tokens = sum(len(m.get("content") or "") for m in messages) // 4
+    if total_tokens < config.TRIM_AT_TOKENS:
+        return
+    task = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    old = tool_idxs[:-config.KEEP_FULL_TOOL_RESULTS] if config.KEEP_FULL_TOOL_RESULTS else tool_idxs
+    targets = [i for i in old
+               if not (messages[i].get("content") or "").startswith(config.TRIM_PREFIX)
+               and len(messages[i].get("content") or "") > config.TRIM_MIN_CHARS]
+    if not targets:
+        return
+    config.console.print(f"[dim]compacting {len(targets)} old tool output"
+                  f"{'s' if len(targets) != 1 else ''}…[/dim]")
+    for i in targets:
+        m       = messages[i]
+        content = m.get("content", "")
+        name    = m.get("name", "tool")
+        nlines  = content.count("\n") + 1
+        marker  = f"{config.TRIM_PREFIX}{name} — was {nlines} lines, {len(content)} chars]"
+        summary = summarize_output(name, content, task) if config.SUMMARIZE_ON_TRIM else None
+        m["content"] = f"{marker}\n{summary}" if summary else marker
+
+
+def run_turn(messages, max_steps=20):
+    # max_steps <= 0 means unlimited: no forced final step, no nudge.
+    # A turn fans out into several call_ollama requests (one per tool
+    # round-trip); sum their stats and print one summary line when the turn
+    # finishes, rather than a line per call.
+    turn_stats = {}
+    calls = 0
+    step = 0
+    while max_steps <= 0 or step < max_steps:
+        trim_history(messages)
+        # Last allowed step: force an answer. We keep the tool schemas in the
+        # payload (dropping them would shift the cached prefix and bust nearly
+        # the whole prefill) and instead append a nudge at the *tail* — only its
+        # own tokens prefill, so the prefix cache stays intact.
+        last = max_steps > 0 and step == max_steps - 1
+        if last:
+            messages.append({"role": "user", "content": STEP_LIMIT_NUDGE})
+
+        content, tool_calls, cancelled, stats = call_ollama(messages)
+
+        if cancelled:
+            # User aborted mid-stream. Drop the partial reply (don't commit it
+            # to history) and hand control back to the prompt.
+            config.console.print("[yellow]cancelled[/yellow]")
+            return
+
+        if stats:
+            calls += 1
+            for k, v in stats.items():
+                turn_stats[k] = turn_stats.get(k, 0) + v
+
+        # On the forced final step we treat the reply as the answer and drop any
+        # tool_calls it may still carry: we're out of budget, and storing
+        # unanswered tool_calls would corrupt history for the next turn.
+        keep_tc = bool(tool_calls) and not last
+
+        # Build the assistant history entry. The Ollama API expects tool_calls
+        # to be included in the message when present.
+        assistant_msg = {"role": "assistant", "content": content}
+        if keep_tc:
+            assistant_msg["tool_calls"] = tool_calls
+        messages.append(assistant_msg)
+
+        if not keep_tc:
+            # Final answer (normal early finish, or the forced last step) —
+            # render as Markdown, then the turn summary.
+            if content.strip():
+                config.console.print(Markdown(content))
+            else:
+                config.console.print("[yellow]hit step limit; model returned no answer[/yellow]")
+            if turn_stats:
+                config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
+            return
+
+        # Execute each requested tool and feed results back. The finally
+        # block appends stub results for any calls that never ran (e.g.
+        # Ctrl-C mid-tool), so the history never carries an assistant
+        # message with unanswered tool_calls into the next request.
+        answered = 0
+        try:
+            for tc in tool_calls:
+                fn   = tc.get("function", {})
+                name = fn.get("name", "")
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    # Some model versions return arguments as a JSON string.
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+
+                config.console.print(f"[cyan]→ {name}({fmt_args(args)})[/cyan]")
+                result = dispatch(name, args)
+                config.console.print(f"[dim]{truncate(result)}[/dim]\n")
+
+                # Tool results use role "tool", one message per call.
+                messages.append({"role": "tool", "content": result, "name": name})
+                answered += 1
+        finally:
+            for tc in tool_calls[answered:]:
+                name = tc.get("function", {}).get("name", "tool")
+                messages.append({"role": "tool", "content": "[interrupted before this tool ran]", "name": name})
+
+        step += 1
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def main():
+    ap = argparse.ArgumentParser(description="Minimal local coding agent over Ollama.")
+    ap.add_argument("prompt",      nargs="*",      help="initial task (optional)")
+    ap.add_argument("--model",     default=None,   help=f"Ollama model tag (default: {config.MODEL}, or the saved model when resuming)")
+    ap.add_argument("--yes",       action="store_true", help="auto-approve writes and commands")
+    ap.add_argument("--max-steps", type=int, default=20, help="max tool calls per task (0 = unlimited)")
+    ap.add_argument("--resume",    nargs="?", const="", default=None,
+                     help="resume a saved session by name; bare --resume resumes the most recent")
+    args = ap.parse_args()
+
+    if args.model:
+        config.MODEL = args.model
+    config.AUTO_YES = args.yes
+
+    # Persistent prompt history: importing readline upgrades input() in place,
+    # so config.console.input gets line editing and up-arrow recall for free.
+    if readline:
+        histfile = os.path.expanduser("~/.tiny_agent_history")
+        with contextlib.suppress(OSError):
+            readline.read_history_file(histfile)
+        readline.set_history_length(500)
+        readline.parse_and_bind("set enable-bracketed-paste on")
+
+        def save_history():
+            with contextlib.suppress(OSError):
+                readline.write_history_file(histfile)
+        atexit.register(save_history)
+
+    messages       = [{"role": "system", "content": config.SYSTEM}]
+    first_user_msg = True
+    session_name   = None
+
+    def autosave():
+        # Skip a system-prompt-only conversation so exits without real work
+        # don't litter the session store.
+        if len(messages) > 1:
+            with contextlib.suppress(OSError):
+                save_session(session_name or default_ts_name(), messages)
+    atexit.register(autosave)
+
+    if args.resume is not None:
+        path = resolve_session(args.resume)
+        if path:
+            name = os.path.splitext(os.path.basename(path))[0]
+            try:
+                data = load_session(name)
+                apply_session(messages, data, args.model)
+                session_name   = name
+                first_user_msg = False
+                config.console.print(f"[dim]resumed session '{name}' ({len(messages)} messages)[/dim]")
+            except (OSError, ValueError, KeyError, TypeError):
+                config.console.print("[yellow]could not read session; starting fresh[/yellow]")
+        else:
+            config.console.print("[yellow]no matching session; starting fresh[/yellow]")
+
+    # cwd injected into the FIRST user message only — keeps the system prompt
+    # byte-identical across projects so the prefix cache hits every session.
+    # (For a resumed session first_user_msg is already False, so this is only
+    # ever used for a fresh one — computed after any resume-triggered chdir.)
+    cwd_context = f"Working directory: {os.getcwd()}\n\n"
+
+    initial = " ".join(args.prompt).strip()
+
+    # Interactive start: prefill the static prefix — or, if a session was just
+    # restored, the full restored history — while the user types their first
+    # prompt. With an argv prompt the real request follows immediately, so a
+    # warmup would just queue ahead of it for no gain.
+    if not initial:
+        # A snapshot, not the live list: the main loop may append the user's
+        # first message to `messages` before this thread's request goes out.
+        threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
+
+    config.console.print(f"[bold]tiny-agent[/bold] · {config.MODEL} · {os.getcwd()}")
+    config.console.print(
+        "[dim]model warms up in the background; the first reply is slow if it "
+        "hasn't finished. later turns reuse the KV cache. press Esc/q to "
+        "cancel a reply, '/clear' to reset context, '/save', '/resume', "
+        "'/sessions' to pause/switch conversations (each takes an optional "
+        "name), 'exit' to quit.[/dim]\n"
+    )
+
+    while True:
+        if initial:
+            user    = initial
+            initial = None
+            config.console.print(f"[bold green]you[/bold green] {user}")
+        else:
+            try:
+                user = read_prompt("[bold green]you[/bold green] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                config.console.print("\nbye")
+                return
+
+        if user.lower() in ("exit", "quit"):
+            return
+        if user.lower() in ("/clear", "clear"):
+            # Drop all conversation history but keep messages[0] (the static
+            # system prompt). The system prompt + tool schemas are the cached
+            # prefix, so this frees the context window without paying to
+            # prefill them again. Resetting first_user_msg re-injects the cwd
+            # context into the next first user message.
+            del messages[1:]
+            first_user_msg = True
+            config.console.print("[dim]context cleared (system prompt preserved)[/dim]\n")
+            continue
+        if user.lower() == "/sessions":
+            files = list_sessions()
+            if not files:
+                config.console.print("[dim]no saved sessions[/dim]\n")
+                continue
+            for f in files:
+                name = os.path.splitext(os.path.basename(f))[0]
+                try:
+                    with open(f, "r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                marker = " [bold]*[/bold]" if name == session_name else ""
+                n        = len(meta.get("messages", []))
+                saved_at = meta.get("saved_at", "?")
+                config.console.print(f"[dim]{name}{marker} — {saved_at} · {n} messages[/dim]")
+            config.console.print()
+            continue
+        if user.lower() == "/save" or user.lower().startswith("/save "):
+            arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
+            name = arg_name or session_name or default_ts_name()
+            save_session(name, messages)
+            session_name = name
+            config.console.print(f"[dim]saved session '{name}'[/dim]\n")
+            continue
+        if user.lower() == "/resume" or user.lower().startswith("/resume "):
+            arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
+            path = resolve_session(arg_name)
+            if not path:
+                config.console.print("[yellow]no matching session; conversation unchanged[/yellow]\n")
+                continue
+            new_name = os.path.splitext(os.path.basename(path))[0]
+            # Switching away from a named, non-empty session shouldn't lose it.
+            if session_name and len(messages) > 1:
+                with contextlib.suppress(OSError):
+                    save_session(session_name, messages)
+            try:
+                data = load_session(new_name)
+                apply_session(messages, data)
+            except (OSError, ValueError, KeyError, TypeError):
+                config.console.print("[yellow]could not read session; conversation unchanged[/yellow]\n")
+                continue
+            session_name   = new_name
+            first_user_msg = False
+            config.console.print(f"[dim]resumed session '{new_name}' ({len(messages)} messages)[/dim]\n")
+            threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
+            continue
+        if not user:
+            continue
+
+        content        = (cwd_context + user) if first_user_msg else user
+        first_user_msg = False
+        messages.append({"role": "user", "content": content})
+
+        try:
+            run_turn(messages, max_steps=args.max_steps)
+        except urllib.error.HTTPError as e:
+            body = getattr(e, "body", "") or e.read().decode(errors="replace")
+            config.console.print(f"[red]Ollama error {e.code}: {body.strip() or e.reason}[/red]")
+        except urllib.error.URLError as e:
+            config.console.print(f"[red]cannot reach Ollama at {config.OLLAMA_URL}: {e}[/red]")
+        except KeyboardInterrupt:
+            config.console.print("\n[yellow]interrupted[/yellow]")
+        config.console.print()
