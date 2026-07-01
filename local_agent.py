@@ -554,6 +554,32 @@ def cancel_pressed() -> bool:
     return False
 
 
+BRACKETED_PASTE_ON  = "\x1b[?2004h"
+BRACKETED_PASTE_OFF = "\x1b[?2004l"
+
+
+def read_prompt(prompt: str) -> str:
+    """console.input() with bracketed paste enabled, so a multi-line paste
+    comes back as one message instead of one-per-line.
+
+    Python's input()/readline parses the \\e[200~…\\e[201~ markers a terminal
+    wraps pastes in, but — unlike bash — never emits the escape that turns
+    that mode on, so we do it ourselves. No-op without a tty or readline
+    (nothing would parse the markers, so the escapes would just leak into
+    the text). Turned off again before returning so it's not left on during
+    streaming, where cancel_pressed() would otherwise misread the paste's
+    leading \\x1b as the cancel key.
+    """
+    bracket = bool(readline) and sys.stdin.isatty()
+    if bracket:
+        sys.stdout.write(BRACKETED_PASTE_ON); sys.stdout.flush()
+    try:
+        return console.input(prompt)
+    finally:
+        if bracket:
+            sys.stdout.write(BRACKETED_PASTE_OFF); sys.stdout.flush()
+
+
 def _render_stream(thinking: str, content: str) -> Text:
     """Build the live view: reasoning above the answer-so-far, both dim.
 
@@ -1038,6 +1064,7 @@ def main():
         with contextlib.suppress(OSError):
             readline.read_history_file(histfile)
         readline.set_history_length(500)
+        readline.parse_and_bind("set enable-bracketed-paste on")
 
         def save_history():
             with contextlib.suppress(OSError):
@@ -1104,7 +1131,7 @@ def main():
             console.print(f"[bold green]you[/bold green] {user}")
         else:
             try:
-                user = console.input("[bold green]you[/bold green] ").strip()
+                user = read_prompt("[bold green]you[/bold green] ").strip()
             except (EOFError, KeyboardInterrupt):
                 console.print("\nbye")
                 return
