@@ -38,6 +38,24 @@ EMPTY_RETRY_NUDGE = "[your last reply was empty — please continue.]"
 MAX_EMPTY_RETRIES = 2
 
 
+def _msg_tokens(m):
+    """Token estimate for one message, including the fields that actually
+    ride along in the request body — not just `content`. `thinking` is fed
+    back across a turn's tool round-trips (see run_turn) and `tool_calls` is
+    serialized JSON, so a content-only count understates the real prefill and
+    lets the window overflow silently (Ollama then drops the front of the
+    prompt — the system prompt — and every call re-prefills from scratch)."""
+    n = len(m.get("content") or "") + len(m.get("thinking") or "")
+    tool_calls = m.get("tool_calls")
+    if tool_calls:
+        n += len(json.dumps(tool_calls))
+    return n // 4
+
+
+def _total_tokens(messages):
+    return sum(_msg_tokens(m) for m in messages)
+
+
 def trim_history(messages):
     """Collapse old tool outputs in place to conserve the context window.
 
@@ -48,7 +66,7 @@ def trim_history(messages):
     keep-window in one pass. One cache bust per long session, not one per step.
 
     The token estimate uses the ~4 chars/token heuristic; it only needs to be
-    right to within the 30% headroom left below NUM_CTX.
+    right to within the headroom left below NUM_CTX.
 
     When SUMMARIZE_ON_TRIM is set, each collapsed output is first run through
     summarize_output (a fresh session on the same model) so the kept stub is an
@@ -59,28 +77,79 @@ def trim_history(messages):
     Idempotent by construction: every collapsed message is prefixed with
     TRIM_PREFIX and skipped on later passes (a length check no longer suffices,
     since a digest can be longer than TRIM_MIN_CHARS).
+
+    After collapsing eligible tool outputs, a backstop hard-truncates any
+    remaining oversized message outside a protected recent tail. Tool-output
+    collapsing alone can't help when the bloat is in long assistant/user
+    messages, or when the keep-window itself is what's oversized — without
+    this, those cases silently overflow NUM_CTX.
     """
-    total_tokens = sum(len(m.get("content") or "") for m in messages) // 4
-    if total_tokens < config.TRIM_AT_TOKENS:
+    if _total_tokens(messages) < config.TRIM_AT_TOKENS:
         return
-    task = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    task = next((m["content"] for m in reversed(messages)
+                 if m.get("role") == "user"
+                 and m.get("content") not in (STEP_LIMIT_NUDGE, EMPTY_RETRY_NUDGE)), "")
     tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     old = tool_idxs[:-config.KEEP_FULL_TOOL_RESULTS] if config.KEEP_FULL_TOOL_RESULTS else tool_idxs
     targets = [i for i in old
                if not (messages[i].get("content") or "").startswith(config.TRIM_PREFIX)
                and len(messages[i].get("content") or "") > config.TRIM_MIN_CHARS]
-    if not targets:
+    if targets:
+        config.console.print(f"[dim]compacting {len(targets)} old tool output"
+                      f"{'s' if len(targets) != 1 else ''}…[/dim]")
+        for i in targets:
+            m       = messages[i]
+            content = m.get("content", "")
+            name    = m.get("name", "tool")
+            nlines  = content.count("\n") + 1
+            marker  = f"{config.TRIM_PREFIX}{name} — was {nlines} lines, {len(content)} chars]"
+            summary = summarize_output(name, content, task) if config.SUMMARIZE_ON_TRIM else None
+            m["content"] = f"{marker}\n{summary}" if summary else marker
+
+    if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:
         return
-    config.console.print(f"[dim]compacting {len(targets)} old tool output"
-                  f"{'s' if len(targets) != 1 else ''}…[/dim]")
-    for i in targets:
-        m       = messages[i]
-        content = m.get("content", "")
-        name    = m.get("name", "tool")
-        nlines  = content.count("\n") + 1
-        marker  = f"{config.TRIM_PREFIX}{name} — was {nlines} lines, {len(content)} chars]"
-        summary = summarize_output(name, content, task) if config.SUMMARIZE_ON_TRIM else None
-        m["content"] = f"{marker}\n{summary}" if summary else marker
+    protected = set(range(max(0, len(messages) - config.KEEP_RECENT_MESSAGES), len(messages)))
+    protected.add(0)   # system prompt
+
+    # Step 1: hard-truncate oversized content outside the protected tail, and
+    # drop `thinking` off those same messages — it's being thrown away anyway.
+    # The marker is PREPENDED (unlike the tool-collapse marker style above)
+    # so the startswith(TRIM_PREFIX) guard actually recognizes an
+    # already-truncated message on a later pass instead of re-editing it
+    # every time and destroying the original "was N chars" figure.
+    for i, m in enumerate(messages):
+        if i in protected:
+            continue
+        m.pop("thinking", None)
+        content = m.get("content") or ""
+        if len(content) <= config.TRIM_MIN_CHARS or content.startswith(config.TRIM_PREFIX):
+            continue
+        marker = f"{config.TRIM_PREFIX}hard-truncated, was {len(content)} chars]"
+        m["content"] = f"{marker}\n{content[:config.TRIM_MIN_CHARS]}"
+        if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:
+            return
+
+    # Step 2: content alone wasn't enough — the overage is `thinking` fields
+    # on protected (recent) messages, which step 1 never touches. Drop it
+    # there too, except on the single most recent assistant message, so a
+    # thinking model mid-turn doesn't lose the reasoning it's about to build
+    # on for its very next step.
+    last_assistant_idx = next((i for i in range(len(messages) - 1, -1, -1)
+                                if messages[i].get("role") == "assistant"), None)
+    for i in sorted(protected):
+        if i == last_assistant_idx:
+            continue
+        messages[i].pop("thinking", None)
+        if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:
+            return
+
+    # Step 3: still over budget — most likely the protected tail itself
+    # (short contents, or the one thinking field we deliberately kept) is
+    # simply too large. Warn rather than silently exceed NUM_CTX.
+    config.console.print(
+        "[yellow]warning: context still exceeds the safety margin after "
+        "trimming; the model may lose the system prompt[/yellow]"
+    )
 
 
 def drop_thinking(messages, start):
@@ -99,6 +168,37 @@ def drop_thinking(messages, start):
             m.pop("thinking", None)
 
 
+def _is_stray_nudge(m):
+    """A step-limit/empty-retry nudge, or the empty assistant reply that
+    prompted one — the pieces strip_nudges removes once a turn ends. Exposed
+    separately so a restored session (main()'s apply_session call sites) can
+    run the same filter: a turn interrupted before strip_nudges ran (a
+    Ctrl-C or a dropped connection propagating out of run_turn) can persist
+    one of these into an autosaved session, and it would otherwise sit there
+    forever, including being handed to the summarizer as "the task".
+    """
+    if m.get("role") == "user" and m.get("content") in (STEP_LIMIT_NUDGE, EMPTY_RETRY_NUDGE):
+        return True
+    if (m.get("role") == "assistant" and not (m.get("content") or "").strip()
+            and not m.get("tool_calls")):
+        return True
+    return False
+
+
+def strip_nudges(messages, start):
+    """Remove stray nudges (see _is_stray_nudge) from `start` onward, once
+    the turn has its real answer. They're single-purpose "try again" prompts
+    for getting the model unstuck mid-turn; left in place they persist into
+    later turns and saved sessions as stray "[your last reply was empty...]"
+    filler. Edits committed history, so — like drop_thinking — this busts
+    the KV cache, paid once at the same turn boundary drop_thinking already
+    busts it at.
+    """
+    keep = messages[:start]
+    keep.extend(m for m in messages[start:] if not _is_stray_nudge(m))
+    messages[:] = keep
+
+
 def run_turn(messages, max_steps=20):
     # max_steps <= 0 means unlimited: no forced final step, no nudge.
     # A turn fans out into several call_ollama requests (one per tool
@@ -108,109 +208,114 @@ def run_turn(messages, max_steps=20):
     calls = 0
     step = 0
     empty_retries = 0
-    # Where this turn's messages begin, so drop_thinking can find them at the
-    # end and strip the reasoning we fed back across the turn's tool round-trips.
+    # Where this turn's messages begin, so drop_thinking/strip_nudges can find
+    # them at the end and clean up what was fed back across the turn's tool
+    # round-trips.
     turn_start = len(messages)
-    while max_steps <= 0 or step < max_steps:
-        trim_history(messages)
-        # Last allowed step: force an answer. We keep the tool schemas in the
-        # payload (dropping them would shift the cached prefix and bust nearly
-        # the whole prefill) and instead append a nudge at the *tail* — only its
-        # own tokens prefill, so the prefix cache stays intact.
-        last = max_steps > 0 and step == max_steps - 1
-        if last:
-            messages.append({"role": "user", "content": STEP_LIMIT_NUDGE})
+    try:
+        while max_steps <= 0 or step < max_steps:
+            trim_history(messages)
+            # Last allowed step: force an answer. We keep the tool schemas in the
+            # payload (dropping them would shift the cached prefix and bust nearly
+            # the whole prefill) and instead append a nudge at the *tail* — only its
+            # own tokens prefill, so the prefix cache stays intact.
+            last = max_steps > 0 and step == max_steps - 1
+            if last:
+                messages.append({"role": "user", "content": STEP_LIMIT_NUDGE})
 
-        content, thinking, tool_calls, cancelled, stats = call_ollama(messages)
+            content, thinking, tool_calls, cancelled, stats = call_ollama(messages)
 
-        if cancelled:
-            # User aborted mid-stream. Drop the partial reply (don't commit it
-            # to history) and hand control back to the prompt. The turn is over,
-            # so shed the reasoning fed back on earlier steps too.
-            drop_thinking(messages, turn_start)
-            config.console.print("[yellow]cancelled[/yellow]")
-            return
+            if cancelled:
+                # User aborted mid-stream. Drop the partial reply (don't commit
+                # it to history) and hand control back to the prompt.
+                config.console.print("[yellow]cancelled[/yellow]")
+                return
 
-        if stats:
-            calls += 1
-            for k, v in stats.items():
-                turn_stats[k] = turn_stats.get(k, 0) + v
+            if stats:
+                calls += 1
+                for k, v in stats.items():
+                    turn_stats[k] = turn_stats.get(k, 0) + v
 
-        # On the forced final step we treat the reply as the answer and drop any
-        # tool_calls it may still carry: we're out of budget, and storing
-        # unanswered tool_calls would corrupt history for the next turn.
-        keep_tc = bool(tool_calls) and not last
+            # On the forced final step we treat the reply as the answer and drop any
+            # tool_calls it may still carry: we're out of budget, and storing
+            # unanswered tool_calls would corrupt history for the next turn.
+            keep_tc = bool(tool_calls) and not last
 
-        # Build the assistant history entry. The Ollama API expects tool_calls
-        # to be included in the message when present.
-        assistant_msg = {"role": "assistant", "content": content}
-        if keep_tc:
-            assistant_msg["tool_calls"] = tool_calls
-        # Carry the reasoning on the assistant message so the next step gets it
-        # back and can build on it instead of re-deriving from scratch after
-        # each tool result. Appended, not edited, so the prefix cache is intact;
-        # drop_thinking sheds it all once the turn produces a final answer.
-        if thinking:
-            assistant_msg["thinking"] = thinking
-        messages.append(assistant_msg)
+            # Build the assistant history entry. The Ollama API expects tool_calls
+            # to be included in the message when present.
+            assistant_msg = {"role": "assistant", "content": content}
+            if keep_tc:
+                assistant_msg["tool_calls"] = tool_calls
+            # Carry the reasoning on the assistant message so the next step gets it
+            # back and can build on it instead of re-deriving from scratch after
+            # each tool result. Appended, not edited, so the prefix cache is intact;
+            # drop_thinking sheds it all once the turn produces a final answer.
+            if thinking:
+                assistant_msg["thinking"] = thinking
+            messages.append(assistant_msg)
 
-        if not keep_tc:
-            # A wholly empty reply (no content, no tools) isn't a real finish —
-            # give the model another swing, up to MAX_EMPTY_RETRIES times, by
-            # appending a neutral nudge and re-entering the loop. Not on the
-            # forced last step (out of budget) and not once the cap is hit.
-            if not content.strip() and not last and empty_retries < MAX_EMPTY_RETRIES:
-                empty_retries += 1
-                messages.append({"role": "user", "content": EMPTY_RETRY_NUDGE})
-                continue
+            if not keep_tc:
+                # A wholly empty reply (no content, no tools) isn't a real finish —
+                # give the model another swing, up to MAX_EMPTY_RETRIES times, by
+                # appending a neutral nudge and re-entering the loop. Not on the
+                # forced last step (out of budget) and not once the cap is hit.
+                if not content.strip() and not last and empty_retries < MAX_EMPTY_RETRIES:
+                    empty_retries += 1
+                    messages.append({"role": "user", "content": EMPTY_RETRY_NUDGE})
+                    continue
 
-            # Final answer (normal early finish, or the forced last step) —
-            # the turn is done, so shed the reasoning we fed back across its
-            # steps, then render as Markdown and the turn summary.
-            drop_thinking(messages, turn_start)
-            if content.strip():
-                config.console.print(Markdown(content))
-            elif last:
-                config.console.print("[yellow]hit step limit; model returned no answer[/yellow]")
-            else:
-                config.console.print("[yellow]model returned an empty answer[/yellow]")
-            if turn_stats:
-                config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
-            return
+                # Final answer (normal early finish, or the forced last step).
+                if content.strip():
+                    config.console.print(Markdown(content))
+                elif last:
+                    config.console.print("[yellow]hit step limit; model returned no answer[/yellow]")
+                else:
+                    config.console.print("[yellow]model returned an empty answer[/yellow]")
+                if turn_stats:
+                    config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
+                return
 
-        # Execute each requested tool and feed results back. The finally
-        # block appends stub results for any calls that never ran (e.g.
-        # Ctrl-C mid-tool), so the history never carries an assistant
-        # message with unanswered tool_calls into the next request.
-        answered = 0
-        try:
-            for tc in tool_calls:
-                fn   = tc.get("function", {})
-                name = fn.get("name", "")
-                args = fn.get("arguments", {})
-                if isinstance(args, str):
-                    # Some model versions return arguments as a JSON string.
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {}
+            # Execute each requested tool and feed results back. The finally
+            # block appends stub results for any calls that never ran (e.g.
+            # Ctrl-C mid-tool), so the history never carries an assistant
+            # message with unanswered tool_calls into the next request.
+            answered = 0
+            try:
+                for tc in tool_calls:
+                    fn   = tc.get("function", {})
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        # Some model versions return arguments as a JSON string.
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            args = {}
 
-                config.console.print(f"[cyan]→ {name}({fmt_args(args)})[/cyan]")
-                result = dispatch(name, args)
-                config.console.print(f"[dim]{truncate(result)}[/dim]\n")
+                    config.console.print(f"[cyan]→ {name}({fmt_args(args)})[/cyan]")
+                    result = dispatch(name, args)
+                    config.console.print(f"[dim]{truncate(result)}[/dim]\n")
 
-                # Tool results use role "tool", one message per call.
-                messages.append({"role": "tool", "content": result, "name": name})
-                answered += 1
-        finally:
-            for tc in tool_calls[answered:]:
-                name = tc.get("function", {}).get("name", "tool")
-                messages.append({"role": "tool", "content": "[interrupted before this tool ran]", "name": name})
+                    # Tool results use role "tool", one message per call.
+                    messages.append({"role": "tool", "content": result, "name": name})
+                    answered += 1
+            finally:
+                for tc in tool_calls[answered:]:
+                    name = tc.get("function", {}).get("name", "tool")
+                    messages.append({"role": "tool", "content": "[interrupted before this tool ran]", "name": name})
 
-        # A productive tool round-trip clears the empty streak, so rare one-off
-        # empties across a long turn don't accumulate toward the cap.
-        empty_retries = 0
-        step += 1
+            # A productive tool round-trip clears the empty streak, so rare one-off
+            # empties across a long turn don't accumulate toward the cap.
+            empty_retries = 0
+            step += 1
+    finally:
+        # Every exit from this function — normal return, a cancelled stream,
+        # or an exception (a stalled connection, an HTTP error) propagating
+        # out of call_ollama — is a turn boundary. Cleaning up here instead
+        # of at each individual exit point means an abort can no longer skip
+        # it and leave stale thinking/nudges sitting in committed history.
+        drop_thinking(messages, turn_start)
+        strip_nudges(messages, turn_start)
 
 # --------------------------------------------------------------------------- #
 # CLI
@@ -263,6 +368,9 @@ def main():
             try:
                 data = load_session(name)
                 apply_session(messages, data, args.model)
+                # A session saved by a run that was interrupted mid-turn (before
+                # strip_nudges ran) can carry a stray nudge; drop it on restore.
+                messages[:] = [m for m in messages if not _is_stray_nudge(m)]
                 session_name   = name
                 first_user_msg = False
                 config.console.print(f"[dim]resumed session '{name}' ({len(messages)} messages)[/dim]")
@@ -270,12 +378,6 @@ def main():
                 config.console.print("[yellow]could not read session; starting fresh[/yellow]")
         else:
             config.console.print("[yellow]no matching session; starting fresh[/yellow]")
-
-    # cwd injected into the FIRST user message only — keeps the system prompt
-    # byte-identical across projects so the prefix cache hits every session.
-    # (For a resumed session first_user_msg is already False, so this is only
-    # ever used for a fresh one — computed after any resume-triggered chdir.)
-    cwd_context = f"Working directory: {os.getcwd()}\n\n"
 
     initial = " ".join(args.prompt).strip()
 
@@ -359,7 +461,8 @@ def main():
                     save_session(session_name, messages)
             try:
                 data = load_session(new_name)
-                apply_session(messages, data)
+                apply_session(messages, data, args.model)
+                messages[:] = [m for m in messages if not _is_stray_nudge(m)]
             except (OSError, ValueError, KeyError, TypeError):
                 config.console.print("[yellow]could not read session; conversation unchanged[/yellow]\n")
                 continue
@@ -371,7 +474,12 @@ def main():
         if not user:
             continue
 
-        content        = (cwd_context + user) if first_user_msg else user
+        # cwd injected into the FIRST user message only — keeps the system
+        # prompt byte-identical across projects so the prefix cache hits every
+        # session. Computed here, not once at startup, so a `cd` tool call or
+        # a `/clear` (which resets first_user_msg) picks up the current
+        # directory instead of whatever it was when the process started.
+        content        = (f"Working directory: {os.getcwd()}\n\n" + user) if first_user_msg else user
         first_user_msg = False
         messages.append({"role": "user", "content": content})
 
@@ -382,6 +490,15 @@ def main():
             config.console.print(f"[red]Ollama error {e.code}: {body.strip() or e.reason}[/red]")
         except urllib.error.URLError as e:
             config.console.print(f"[red]cannot reach Ollama at {config.OLLAMA_URL}: {e}[/red]")
+        except (TimeoutError, OSError) as e:
+            # A stalled read mid-stream (see STREAM_TIMEOUT in ollama.py) raises
+            # a raw socket timeout here rather than a urllib error, since it
+            # happens while iterating an already-opened response, not while
+            # opening the connection. Without this the process would crash.
+            config.console.print(
+                f"[red]connection to Ollama stalled (no data for "
+                f"{config.STREAM_TIMEOUT}s): {e}[/red]"
+            )
         except KeyboardInterrupt:
             config.console.print("\n[yellow]interrupted[/yellow]")
         config.console.print()
