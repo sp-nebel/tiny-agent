@@ -97,13 +97,27 @@ def trim_history(messages):
     if targets:
         config.console.print(f"[dim]compacting {len(targets)} old tool output"
                       f"{'s' if len(targets) != 1 else ''}…[/dim]")
+        # Digesting is a serial CPU prefill per target; only the newest (most
+        # likely still task-relevant) targets are worth the wait. `targets` is
+        # in ascending message-index order, so the tail is the newest.
+        digest_at = set(targets[-config.MAX_TRIM_SUMMARIES:]) if config.MAX_TRIM_SUMMARIES else set()
+        # Circuit breaker: if the summarizer call fails once (server down,
+        # e.g. an OOM restart mid-trim), stop trying it for the rest of this
+        # pass — each further attempt would otherwise wait up to CMD_TIMEOUT
+        # against a server that isn't coming back in time.
+        summarizer_down = False
         for i in targets:
             m       = messages[i]
             content = m.get("content", "")
             name    = m.get("name", "tool")
             nlines  = content.count("\n") + 1
             marker  = f"{config.TRIM_PREFIX}{name} — was {nlines} lines, {len(content)} chars]"
-            summary = summarize_output(name, content, task) if config.SUMMARIZE_ON_TRIM else None
+            summary = None
+            if config.SUMMARIZE_ON_TRIM and i in digest_at and not summarizer_down:
+                summary = summarize_output(name, content, task)
+                if summary is None:
+                    summarizer_down = True
+                    config.console.print("[dim]summarizer unavailable; using plain stubs for the rest of this pass[/dim]")
             m["content"] = f"{marker}\n{summary}" if summary else marker
 
     if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:

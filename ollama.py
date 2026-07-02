@@ -44,7 +44,7 @@ def _chat_request(payload):
     )
 
 
-def call_ollama(messages):
+def call_ollama(messages, _retried_refused=False):
     """Stream a chat turn.
 
     Returns (content: str, thinking: str, tool_calls: list, cancelled: bool,
@@ -77,8 +77,23 @@ def call_ollama(messages):
         # tool support, bad request) must surface, so check the error body.
         if config.THINK and e.code == 400 and "think" in body.lower():
             config.THINK = False
-            return call_ollama(messages)
+            return call_ollama(messages, _retried_refused)
         e.body = body   # already consumed; stash for the handler in main()
+        raise
+    except urllib.error.URLError as e:
+        # Connection refused usually means Ollama is mid-restart (e.g.
+        # systemd bouncing it back up seconds after an OOM kill). One retry
+        # after a short delay rides through that window instead of losing
+        # the turn; the resent payload is byte-identical. A single flag
+        # (not unbounded recursion) keeps this from compounding with the
+        # think-fallback retry above into more than one wait.
+        if not _retried_refused and isinstance(e.reason, ConnectionRefusedError):
+            config.console.print(
+                f"[dim]Ollama unreachable — it may have been restarted; "
+                f"retrying in {config.RETRY_REFUSED_DELAY}s…[/dim]"
+            )
+            time.sleep(config.RETRY_REFUSED_DELAY)
+            return call_ollama(messages, True)
         raise
 
     # cbreak lets us catch a single cancel keypress without blocking the

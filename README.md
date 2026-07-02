@@ -48,6 +48,8 @@ python local_agent.py
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API base URL |
 | `AGENT_THINK` | `1` | Set to `0` to disable reasoning output |
 | `AGENT_SUMMARIZE_TRIM` | `1` | Set to `0` to elide trimmed tool outputs instead of summarizing them |
+| `AGENT_MAX_TRIM_SUMMARIES` | `6` | Max tool outputs digested (rather than plain-stubbed) per trim pass |
+| `AGENT_NUM_CTX` | `24576` | Ollama context window size; lower on memory-constrained machines |
 
 ### Interactive commands
 
@@ -91,6 +93,8 @@ After each model turn a dim stats line is printed, e.g. `prefill 142 tok in 3.2s
 
 **Reasoning feedback** — a model's `thinking` output is carried on its assistant message and fed back on later tool round-trips *within* a turn, so it doesn't have to re-derive its chain of thought after every tool result. It's stripped once the turn produces a final answer. On a thinking model, that strip busts the KV cache back to the start of the turn, so each multi-step turn re-prefills its own tool round-trips on the next turn — the "once per session" prefill claim above applies to the static system prompt and schemas, not to every token exchanged.
 
-**Summarize-on-trim** — rather than discarding a collapsed output to a bare `[elided]` stub, the agent spawns a fresh, empty Ollama session on the *same* resident model to digest it down to the task-relevant facts (paths, line numbers, names, errors) and keeps that digest. This only ever runs at the trim moment — when the window is already under pressure and the cache is being busted anyway — so short sessions pay nothing for it. Failures fall back to the plain stub. Disable with `AGENT_SUMMARIZE_TRIM=0`.
+**Summarize-on-trim** — rather than discarding a collapsed output to a bare `[elided]` stub, the agent spawns a fresh, empty Ollama session on the *same* resident model to digest it down to the task-relevant facts (paths, line numbers, names, errors) and keeps that digest. This only ever runs at the trim moment — when the window is already under pressure and the cache is being busted anyway — so short sessions pay nothing for it. Digesting is a serial CPU prefill per collapsed output, so only the newest `AGENT_MAX_TRIM_SUMMARIES` (default 6) targets get a real digest; older ones fall back to the plain stub. If a summarizer call fails once (e.g. Ollama died mid-pass), the rest of that pass also falls back to plain stubs rather than each waiting out a timeout against a dead server. Disable digesting entirely with `AGENT_SUMMARIZE_TRIM=0`.
+
+**Surviving an Ollama restart mid-turn** — on a memory-constrained machine, a long session can OOM-kill the Ollama runner (host-memory prompt-cache state scales with resident context tokens, and trimming's summarizer calls are the moment most likely to tip it over, since each one swaps a different prompt into the busy slot). systemd typically restarts Ollama within seconds; if the next request hits that window as connection-refused, the agent waits `RETRY_REFUSED_DELAY` (5s) and retries once with the identical payload before giving up. Lower `AGENT_NUM_CTX` if OOM kills recur.
 
 **Native tool calling** — tools are passed via Ollama's `tools` parameter as JSON schemas, not described in the system prompt, so the model uses the format it was actually trained on.

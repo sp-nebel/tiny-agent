@@ -17,7 +17,13 @@ MAX_GLOB_HITS  = 20
 MAX_LIST_HITS  = 200
 MAX_CMD_CHARS  = 8000
 CMD_TIMEOUT    = 120
-NUM_CTX        = 32768
+
+# Ollama's host-memory prompt-cache saves (and, for SWA models, per-checkpoint
+# state) scale with resident context tokens. On memory-constrained boxes a
+# long session can push the runner OOM right at the moment it swaps prompts
+# (e.g. during trim_history's summarizer calls, which prefill a *different*
+# prompt against the same slot). Lower via AGENT_NUM_CTX if that happens.
+NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "24576"))
 
 # Socket timeout for the streaming /api/chat request — applies per network
 # read, not to the whole generation, so a normal (if slow) CPU decode keeps
@@ -25,6 +31,13 @@ NUM_CTX        = 32768
 # hangs with nothing arriving at all. A very slow CPU-only prefill can
 # legitimately take longer than the default; raise via AGENT_STREAM_TIMEOUT.
 STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
+
+# A refused connection usually means Ollama is mid-restart (e.g. systemd
+# bouncing it back up after an OOM kill, which takes a few seconds). One
+# retry after this delay lets the turn survive that window instead of
+# failing outright; the payload resent is byte-identical, so this has no
+# cache impact beyond what the restart itself already cost.
+RETRY_REFUSED_DELAY = 5
 
 # Hard cap on any single tool result (grep/read_file/list_dir/find_files), so
 # one call — a long grep context block, a read_file line hitting minified or
@@ -57,6 +70,13 @@ KEEP_RECENT_MESSAGES    = 6
 # sessions. Disable with AGENT_SUMMARIZE_TRIM=0 to get the old [elided] stubs.
 SUMMARIZE_ON_TRIM  = os.environ.get("AGENT_SUMMARIZE_TRIM", "1") not in ("0", "false", "")
 SUMMARY_MAX_TOKENS = 256          # bounds the gen cost of each digest
+# A trim pass can have dozens of eligible targets; digesting all of them means
+# that many serial CPU prefills (each swapping the busy slot to a different
+# prompt) before the turn continues — minutes of silent stall, and repeated
+# prompt-cache churn. Only the newest N targets (most likely still relevant
+# to the current task) get a real digest; older ones fall back to the plain
+# marker. 0 disables digesting entirely (same effect as AGENT_SUMMARIZE_TRIM=0).
+MAX_TRIM_SUMMARIES = int(os.environ.get("AGENT_MAX_TRIM_SUMMARIES", "6"))
 # Sentinel prefixing every compacted message. A summary can exceed
 # TRIM_MIN_CHARS, so "a stub is short → never re-collapsed" no longer holds;
 # trim_history skips anything already starting with this prefix instead.

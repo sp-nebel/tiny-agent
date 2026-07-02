@@ -32,8 +32,10 @@ Usage:
 Env vars:
     AGENT_MODEL           (default: gemma4:12b-it-qat)   — any Ollama model with tool support
     OLLAMA_URL            (default: http://localhost:11434)
-    AGENT_THINK           (default: 1) — set to 0 to disable reasoning output
-    AGENT_SUMMARIZE_TRIM  (default: 1) — set to 0 to elide trimmed tool outputs instead of summarizing them
+    AGENT_THINK              (default: 1) — set to 0 to disable reasoning output
+    AGENT_SUMMARIZE_TRIM     (default: 1) — set to 0 to elide trimmed tool outputs instead of summarizing them
+    AGENT_MAX_TRIM_SUMMARIES (default: 6) — max tool outputs digested (vs. plain-stubbed) per trim pass
+    AGENT_NUM_CTX            (default: 24576) — Ollama context window size; lower on memory-constrained machines
 
 Dependency: pip install rich
 Note: ensure Ollama >= 0.20.2 for reliable Gemma 4 tool-call parsing.
