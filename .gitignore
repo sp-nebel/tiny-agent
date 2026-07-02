@@ -17,8 +17,9 @@ env/
 # macOS artifacts
 .DS_Store
 
-# Local development and agent caches
-.claude/
+# Local development and agent caches (but track shared project skills)
+.claude/*
+!.claude/skills/
 # Python cache directory
 __pycache__/
 
