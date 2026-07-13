@@ -25,9 +25,9 @@ tools run without any server. Exercise the changed function directly with `pytho
 short throwaway script. Examples to adapt:
 
 ```bash
-# trim_history on a synthetic conversation (no Ollama needed if summarize is off)
+# trim_history on a synthetic conversation (no Ollama needed)
 python3 -c "
-import config; config.SUMMARIZE_ON_TRIM = False
+import config
 from agent import trim_history, _total_tokens
 msgs = [{'role': 'system', 'content': 'S'}]
 msgs += [{'role': 'user', 'content': 'task'}]
@@ -67,9 +67,10 @@ a Markdown answer, then a dim stats line.
 NOT served from the KV prefix cache. So in an interactive session, ask a second question and
 check its stats: turn 2+ prefill should be roughly the size of the new messages only. A
 full-conversation-sized prefill on a later turn means your change busted the prefix cache —
-go back to the `cache-discipline` checklist. (Exception: the first turn after `trim_history`
-fires or after a multi-step thinking turn legitimately re-prefills; those are the designed
-once-per-session/turn busts.)
+go back to the `cache-discipline` checklist. (Exception: the first call after `trim_history`
+fires, and the first call after any multi-step turn — the turn-boundary cleanup strips
+thinking and stubs the turn's old tool outputs — legitimately re-prefill; those are the
+designed once-per-pass/turn busts.)
 
 If the model isn't available, `ollama pull gemma4:12b-it-qat` or use any tool-capable model
 you have. Do not silently skip this step when you changed `ollama.py` payloads or streaming —

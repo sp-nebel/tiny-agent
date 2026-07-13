@@ -20,15 +20,18 @@ read `verifying-tiny-agent`.
   and documents usage/env vars. **Keep it in sync when behavior changes.**
 - `config.py` — every tunable, in one place. Contains `SYSTEM` (the system prompt, marked
   KEEP BYTE-IDENTICAL — it is the cached prefix) and `TOOL_SCHEMAS` (also part of the cached
-  prefix), plus all caps/thresholds and the summarizer prompt. New knobs go here, env-var
-  overridable where users might need them (`AGENT_*` naming).
+  prefix), plus all caps/thresholds. New knobs go here, env-var overridable where users might
+  need them (`AGENT_*` naming).
 - `agent.py` — the loop. `run_turn` (one user task: repeated model calls + tool round-trips),
-  `trim_history` (lazy 3-step context-window trimming), `drop_thinking` and `strip_nudges`
-  (turn-boundary cleanup, invoked from `run_turn`'s `finally`), `main()` (CLI + REPL with
-  `/clear`, `/save`, `/resume`, `/sessions`).
+  `trim_history` (lazy mid-turn context shedding: tool-output stubs + old-thinking drop +
+  hard-truncate backstop; returns True when it edited history, which gives the next call a
+  prefill-sized stall timeout and one retry), `_stub_tool_outputs` (shared stub helper),
+  `drop_thinking` and `strip_nudges` (turn-boundary cleanup, invoked from `run_turn`'s
+  `finally`, which also stubs the finished turn's oversized tool outputs), `main()` (CLI +
+  REPL with `/clear`, `/save`, `/resume`, `/sessions`).
 - `ollama.py` — HTTP layer. `_build_payload` is the **single source of truth for request
-  bodies**; all three call sites (`call_ollama`, `warm_cache`, `summarize_output`) go through
-  it so model/keep_alive/num_ctx can't drift. `call_ollama` streams and returns
+  bodies**; both call sites (`call_ollama`, `warm_cache`) go through it so
+  model/keep_alive/num_ctx can't drift. `call_ollama` streams and returns
   `(content, thinking, tool_calls, cancelled, stats)`.
 - `tools.py` — tool implementations + `dispatch`. Tools return strings and never raise.
 - `session.py` — save/resume persistence (`~/.tiny_agent_sessions/`). `apply_session` mutates

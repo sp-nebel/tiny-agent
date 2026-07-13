@@ -33,17 +33,22 @@ state its cache impact.** If you can't state it, you don't understand the change
      re-sent some other way.
 
 3. **Cache busts are only allowed at already-expensive, bounded moments:**
-   - `trim_history`: once per long session, and only when the estimate crosses
-     `TRIM_AT_TOKENS`. It deliberately does nothing before that ("untouched history is free").
-   - `drop_thinking` / `strip_nudges`: once per turn boundary, in `run_turn`'s `finally`.
+   - `trim_history`: once per pass, only when the estimate crosses `TRIM_AT_TOKENS`. It
+     deliberately does nothing before that ("untouched history is free"), and when it does
+     fire it sheds aggressively (tool-output stubs + old thinking) because the cost of the
+     bust is the *post-trim prompt size* — SWA models (gemma) re-prefill from token 0 after
+     any edit.
+   - `drop_thinking` / `strip_nudges` / turn-end tool-output stubbing: once per turn
+     boundary, in `run_turn`'s `finally`. The stubbing piggybacks on drop_thinking's
+     existing bust, so on a thinking model it adds no re-prefill of its own.
    A feature that edits history (or varies the payload head) *per step* is wrong by
    construction — redesign it to append, or to piggyback on one of these existing moments.
 
 4. **All request bodies go through `_build_payload`** (ollama.py). `model`, `keep_alive`,
    `options.num_ctx`, and `think` must match between `warm_cache` and `call_ollama`: a
    different `num_ctx` makes Ollama reload the model, and a different `think` renders a
-   different prompt template — either wastes the background warmup entirely.
-   `summarize_output` also matches `num_ctx` for the same reason. Never hand-build a payload.
+   different prompt template — either wastes the background warmup entirely. Never
+   hand-build a payload.
 
 5. **Token accounting must count everything that rides in the request body.** `_msg_tokens`
    (agent.py) counts `content` + `thinking` + serialized `tool_calls` at ~4 chars/token. If a
@@ -60,8 +65,8 @@ Run this on any diff touching messages/payload/prompt:
 1. Do any bytes *before the tail of the message list* change between consecutive calls? Where?
 2. If history is edited, does it happen only inside `trim_history` or the turn-boundary
    cleanup? Is it idempotent (guarded by `TRIM_PREFIX` where applicable)?
-3. Do `warm_cache`, `call_ollama`, and `summarize_output` still send identical
-   model/num_ctx/keep_alive (and matching `think` for the first two)?
+3. Do `warm_cache` and `call_ollama` still send identical model/num_ctx/keep_alive
+   and matching `think`?
 4. Does `_msg_tokens` still count every field the change adds to messages?
 5. State the verdict in one sentence: "cache impact: none / one bust at <existing moment> /
    NEW bust — needs justification."

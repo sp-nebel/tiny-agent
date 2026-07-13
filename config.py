@@ -20,9 +20,8 @@ CMD_TIMEOUT    = 120
 
 # Ollama's host-memory prompt-cache saves (and, for SWA models, per-checkpoint
 # state) scale with resident context tokens. On memory-constrained boxes a
-# long session can push the runner OOM right at the moment it swaps prompts
-# (e.g. during trim_history's summarizer calls, which prefill a *different*
-# prompt against the same slot). Lower via AGENT_NUM_CTX if that happens.
+# long session can push the runner OOM at the moment it saves or swaps slot
+# prompts. Lower via AGENT_NUM_CTX if that happens.
 NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "24576"))
 
 # Socket timeout for the streaming /api/chat request — applies per network
@@ -31,6 +30,19 @@ NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "24576"))
 # hangs with nothing arriving at all. A very slow CPU-only prefill can
 # legitimately take longer than the default; raise via AGENT_STREAM_TIMEOUT.
 STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
+
+# The one *expected* multi-minute silence: the first call after trim_history
+# edits history. On an SWA model the edit forces Ollama to re-prefill the
+# whole trimmed prompt from token 0 before the first byte arrives — on CPU
+# that routinely exceeds STREAM_TIMEOUT with nothing wrong (a fixed 900s
+# constant once killed such a prefill at 92% done). run_turn sizes that one
+# call's timeout as tokens/rate × factor, using the prefill rate measured
+# from live stats when available and this deliberately conservative fallback
+# before one exists (the reference box measures ~14–16 tok/s). The factor
+# absorbs the ~4 chars/token estimate erring low and the rate degrading as
+# the window fills.
+PREFILL_TPS_FALLBACK     = 8.0
+POST_TRIM_TIMEOUT_FACTOR = 2.0
 
 # A refused connection usually means Ollama is mid-restart (e.g. systemd
 # bouncing it back up after an OOM kill, which takes a few seconds). One
@@ -45,14 +57,26 @@ RETRY_REFUSED_DELAY = 5
 # single shot. Same head+tail-keeping shape as run_cmd's existing cap.
 MAX_TOOL_OUTPUT_CHARS = 8000
 
-# History trimming: when the conversation approaches the context window,
-# collapse all but the N most recent tool outputs to a one-line stub. Editing
-# history busts the KV prefix cache from the edit point on, so trimming only
-# happens when the window is actually under pressure — one cache bust per
-# long session, not one per step. Only outputs over the threshold collapse.
+# History trimming: collapse all but the N most recent tool outputs to a
+# one-line stub. This happens at two moments only, both already-paid cache
+# busts (editing history invalidates the KV prefix cache from the edit point
+# on, so it must never happen per step): at every turn boundary for the
+# finished turn's outputs (piggybacked on drop_thinking's bust), and mid-turn
+# in one lazy pass when the estimate crosses TRIM_AT_TOKENS. Only outputs
+# over the threshold collapse.
 KEEP_FULL_TOOL_RESULTS = 3
 TRIM_MIN_CHARS         = 400
 TRIM_AT_TOKENS         = int(NUM_CTX * 0.7)
+
+# Assistant messages (counted from the tail) whose `thinking` a mid-turn trim
+# pass leaves intact. thinking only exists on the live turn's messages, so
+# this sheds the current turn's *older* reasoning while keeping what the model
+# is actively building on. On a thinking-heavy turn that old thinking — which
+# stub-collapsing never touches — is the bulk of what must go to make the
+# post-trim re-prefill cheap: the cost of a trim bust is the post-trim prompt
+# size, since SWA models reprocess from token 0 after any edit. The
+# hard-truncate backstop escalates further, to only the single most recent.
+TRIM_KEEP_THINKING = 4
 
 # Backstop for when collapsing eligible tool outputs still isn't enough (e.g.
 # bloat from long assistant/user messages, or the keep-window itself is
@@ -62,31 +86,11 @@ TRIM_AT_TOKENS         = int(NUM_CTX * 0.7)
 HARD_TRUNCATE_AT_TOKENS = int(NUM_CTX * 0.9)
 KEEP_RECENT_MESSAGES    = 6
 
-# Summarize-on-trim: when trim_history collapses an old tool output, instead of
-# discarding it to a one-line stub, spawn a fresh empty Ollama session (same
-# resident model) to digest it down to the task-relevant facts and keep THAT.
-# Only ever runs at the trim moment — i.e. when the window is already under
-# pressure and the cache is being busted anyway — so it costs nothing on short
-# sessions. Disable with AGENT_SUMMARIZE_TRIM=0 to get the old [elided] stubs.
-SUMMARIZE_ON_TRIM  = os.environ.get("AGENT_SUMMARIZE_TRIM", "1") not in ("0", "false", "")
-SUMMARY_MAX_TOKENS = 256          # bounds the gen cost of each digest
-# A trim pass can have dozens of eligible targets; digesting all of them means
-# that many serial CPU prefills (each swapping the busy slot to a different
-# prompt) before the turn continues — minutes of silent stall, and repeated
-# prompt-cache churn. Only the newest N targets (most likely still relevant
-# to the current task) get a real digest; older ones fall back to the plain
-# marker. 0 disables digesting entirely (same effect as AGENT_SUMMARIZE_TRIM=0).
-MAX_TRIM_SUMMARIES = int(os.environ.get("AGENT_MAX_TRIM_SUMMARIES", "6"))
-# Sentinel prefixing every compacted message. A summary can exceed
-# TRIM_MIN_CHARS, so "a stub is short → never re-collapsed" no longer holds;
-# trim_history skips anything already starting with this prefix instead.
+# Sentinel prefixing every compacted/truncated message, checked instead of a
+# length heuristic: a hard-truncated message keeps TRIM_MIN_CHARS of content,
+# so "a stub is short → never re-collapsed" wouldn't recognise it and every
+# later pass would re-edit it, destroying the original "was N chars" figure.
 TRIM_PREFIX        = "[«compacted» "
-SUMMARIZER_SYSTEM  = (
-    "You compress one tool result for an autonomous coding agent. Given the "
-    "task it was gathered for and the raw output, return a terse factual digest "
-    "(at most ~8 lines) of ONLY what is relevant to the task: file paths, line "
-    "numbers, symbol names, key values, error messages. No preamble, no advice."
-)
 
 # Directories never worth walking in a glob.
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv",

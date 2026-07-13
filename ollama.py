@@ -1,5 +1,6 @@
 import json
 import time
+import socket
 import urllib.request
 import urllib.error
 
@@ -44,8 +45,17 @@ def _chat_request(payload):
     )
 
 
-def call_ollama(messages, _retried_refused=False):
+def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=False):
     """Stream a chat turn.
+
+    timeout overrides STREAM_TIMEOUT for this call only — run_turn passes a
+    prefill-sized value on the call right after a trim pass, whose prefill
+    legitimately stays silent far longer than a healthy-cache call. On that
+    same call it also sets retry_stall: if the stream still times out, retry
+    once with an identical payload before giving up — the server keeps the
+    prefill progress it made (slot cache + checkpoints), so the retry resumes
+    nearly free instead of losing minutes of CPU work with the finish line
+    in sight.
 
     Returns (content: str, thinking: str, tool_calls: list, cancelled: bool,
     stats: dict). Exactly one of content/tool_calls is meaningful: a final
@@ -60,6 +70,8 @@ def call_ollama(messages, _retried_refused=False):
     """
     payload = _build_payload(messages, stream=True, tools=True, think=config.THINK)
     req = _chat_request(payload)
+    if timeout is None:
+        timeout = config.STREAM_TIMEOUT
 
     content    = ""
     thinking   = ""
@@ -68,86 +80,109 @@ def call_ollama(messages, _retried_refused=False):
     stats      = {}
     last_paint = 0.0
 
+    # The outer try exists for the post-trim stall retry: the silent prefill
+    # can time out either while waiting for the response headers (Ollama
+    # flushes them with the first generated chunk) or mid-stream — both raise
+    # a raw socket.timeout, so one enclosing handler covers both sites.
     try:
-        resp = urllib.request.urlopen(req, timeout=config.STREAM_TIMEOUT)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        # Model doesn't support the `think` parameter — disable and retry once
-        # so non-thinking models (the default) keep working. Other 400s (no
-        # tool support, bad request) must surface, so check the error body.
-        if config.THINK and e.code == 400 and "think" in body.lower():
-            config.THINK = False
-            return call_ollama(messages, _retried_refused)
-        e.body = body   # already consumed; stash for the handler in main()
-        raise
-    except urllib.error.URLError as e:
-        # Connection refused usually means Ollama is mid-restart (e.g.
-        # systemd bouncing it back up seconds after an OOM kill). One retry
-        # after a short delay rides through that window instead of losing
-        # the turn; the resent payload is byte-identical. A single flag
-        # (not unbounded recursion) keeps this from compounding with the
-        # think-fallback retry above into more than one wait.
-        if not _retried_refused and isinstance(e.reason, ConnectionRefusedError):
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            # Model doesn't support the `think` parameter — disable and retry
+            # once so non-thinking models (the default) keep working. Other
+            # 400s (no tool support, bad request) must surface, so check the
+            # error body.
+            if config.THINK and e.code == 400 and "think" in body.lower():
+                config.THINK = False
+                return call_ollama(messages, timeout=timeout,
+                                   retry_stall=retry_stall,
+                                   _retried_refused=_retried_refused)
+            e.body = body   # already consumed; stash for the handler in main()
+            raise
+        except urllib.error.URLError as e:
+            # Connection refused usually means Ollama is mid-restart (e.g.
+            # systemd bouncing it back up seconds after an OOM kill). One retry
+            # after a short delay rides through that window instead of losing
+            # the turn; the resent payload is byte-identical. A single flag
+            # (not unbounded recursion) keeps this from compounding with the
+            # think-fallback retry above into more than one wait.
+            if not _retried_refused and isinstance(e.reason, ConnectionRefusedError):
+                config.console.print(
+                    f"[dim]Ollama unreachable — it may have been restarted; "
+                    f"retrying in {config.RETRY_REFUSED_DELAY}s…[/dim]"
+                )
+                time.sleep(config.RETRY_REFUSED_DELAY)
+                return call_ollama(messages, timeout=timeout,
+                                   retry_stall=retry_stall,
+                                   _retried_refused=True)
+            raise
+
+        # cbreak lets us catch a single cancel keypress without blocking the
+        # stream; transient=True clears the live region (thinking included)
+        # when done, so run_turn re-renders only the final answer.
+        with resp, cbreak_stdin():
+            with Live(console=config.console, refresh_per_second=8, transient=True) as live:
+                for raw in resp:
+                    if cancel_pressed():
+                        cancelled = True
+                        break
+
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue   # malformed chunk (e.g. server hiccup) — skip it
+                    msg = obj.get("message", {})
+
+                    # Reasoning streams in its own field (models that emit it).
+                    tdelta = msg.get("thinking", "")
+                    if tdelta:
+                        thinking += tdelta
+
+                    # The actual answer / final text content.
+                    delta = msg.get("content", "")
+                    if delta:
+                        content += delta
+
+                    # Rebuilding the renderable is O(accumulated text), so doing
+                    # it per chunk goes quadratic and steals CPU from inference.
+                    # Live paints at 8 fps anyway; skip updates it would never show.
+                    if (tdelta or delta) and time.monotonic() - last_paint >= 0.12:
+                        live.update(_render_stream(thinking, content))
+                        last_paint = time.monotonic()
+
+                    # Tool calls appear in a dedicated field, often in a chunk
+                    # where content is empty.
+                    tcs = msg.get("tool_calls", [])
+                    if tcs:
+                        tool_calls.extend(tcs)
+
+                    if obj.get("done"):
+                        # Raw counters; run_turn sums these across the turn and
+                        # formats one line at the end via fmt_stats.
+                        stats = {
+                            "prompt_eval_count":    obj.get("prompt_eval_count", 0),
+                            "prompt_eval_duration": obj.get("prompt_eval_duration", 0),
+                            "eval_count":           obj.get("eval_count", 0),
+                            "eval_duration":        obj.get("eval_duration", 0),
+                        }
+                        break
+    except socket.timeout:
+        # Retry once, with retry_stall cleared so the retried request can't
+        # keep retrying itself. Any partial content is discarded — a fresh
+        # request re-prefills its prompt from the server's retained cache
+        # and regenerates.
+        if retry_stall:
             config.console.print(
-                f"[dim]Ollama unreachable — it may have been restarted; "
-                f"retrying in {config.RETRY_REFUSED_DELAY}s…[/dim]"
+                f"[dim]no data for {timeout}s on the post-trim call; retrying "
+                f"once (the server keeps its prefill progress)…[/dim]"
             )
-            time.sleep(config.RETRY_REFUSED_DELAY)
-            return call_ollama(messages, True)
+            return call_ollama(messages, timeout=timeout,
+                               _retried_refused=_retried_refused)
         raise
-
-    # cbreak lets us catch a single cancel keypress without blocking the
-    # stream; transient=True clears the live region (thinking included) when
-    # done, so run_turn re-renders only the final answer.
-    with resp, cbreak_stdin():
-        with Live(console=config.console, refresh_per_second=8, transient=True) as live:
-            for raw in resp:
-                if cancel_pressed():
-                    cancelled = True
-                    break
-
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    obj = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue   # malformed chunk (e.g. server hiccup) — skip it
-                msg = obj.get("message", {})
-
-                # Reasoning streams in its own field (models that emit it).
-                tdelta = msg.get("thinking", "")
-                if tdelta:
-                    thinking += tdelta
-
-                # The actual answer / final text content.
-                delta = msg.get("content", "")
-                if delta:
-                    content += delta
-
-                # Rebuilding the renderable is O(accumulated text), so doing
-                # it per chunk goes quadratic and steals CPU from inference.
-                # Live paints at 8 fps anyway; skip updates it would never show.
-                if (tdelta or delta) and time.monotonic() - last_paint >= 0.12:
-                    live.update(_render_stream(thinking, content))
-                    last_paint = time.monotonic()
-
-                # Tool calls appear in a dedicated field, often in a chunk
-                # where content is empty.
-                tcs = msg.get("tool_calls", [])
-                if tcs:
-                    tool_calls.extend(tcs)
-
-                if obj.get("done"):
-                    # Raw counters; run_turn sums these across the turn and
-                    # formats one line at the end via fmt_stats.
-                    stats = {
-                        "prompt_eval_count":    obj.get("prompt_eval_count", 0),
-                        "prompt_eval_duration": obj.get("prompt_eval_duration", 0),
-                        "eval_count":           obj.get("eval_count", 0),
-                        "eval_duration":        obj.get("eval_duration", 0),
-                    }
-                    break
 
     return content, thinking, tool_calls, cancelled, stats
 
@@ -183,29 +218,3 @@ def warm_cache(messages=None):
             warm_cache(messages)
     except OSError:
         pass
-
-
-def summarize_output(tool_name, content, task):
-    """Digest one oversized tool result down to its task-relevant facts.
-
-    Runs on a fresh, empty 2-message session against the same resident model:
-    no prior history, no tools (the summarizer must not call any), no thinking.
-    num_ctx matches call_ollama exactly so Ollama doesn't reload the model.
-
-    Returns the digest string, or None on any failure (or empty reply) so the
-    caller can fall back to the plain elision stub — summarization must never
-    break a turn.
-    """
-    messages = [
-        {"role": "system", "content": config.SUMMARIZER_SYSTEM},
-        {"role": "user",   "content": f"Task:\n{task}\n\n{tool_name} output:\n{content}"},
-    ]
-    payload = _build_payload(messages, stream=False, tools=False, num_predict=config.SUMMARY_MAX_TOKENS)
-    req = _chat_request(payload)
-    try:
-        with urllib.request.urlopen(req, timeout=config.CMD_TIMEOUT) as resp:
-            obj = json.loads(resp.read())
-    except (OSError, ValueError):
-        return None
-    text = (obj.get("message") or {}).get("content", "").strip()
-    return text or None

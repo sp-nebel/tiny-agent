@@ -10,7 +10,7 @@ from rich.markdown import Markdown
 
 import config
 from tools import dispatch
-from ollama import call_ollama, warm_cache, summarize_output
+from ollama import call_ollama, warm_cache
 from ui import read_prompt, fmt_args, truncate, fmt_stats
 from session import *
 
@@ -56,72 +56,125 @@ def _total_tokens(messages):
     return sum(_msg_tokens(m) for m in messages)
 
 
+# Measured prefill throughput (tok/s), refined over the session; None until
+# the first meaningful sample, when PREFILL_TPS_FALLBACK applies instead.
+# Sizes the post-trim stall timeout — see _post_trim_timeout.
+_prefill_tps = None
+
+
+def _note_prefill_rate(stats):
+    """Fold one call's prefill timing into the running rate estimate.
+
+    Small prefills are skipped: with the prefix cache warm a call prefills
+    only a few hundred tokens, and at that size fixed per-request overhead
+    dominates the timing, which would drag the estimate far below the real
+    throughput a long re-prefill achieves."""
+    global _prefill_tps
+    count    = stats.get("prompt_eval_count", 0)
+    duration = stats.get("prompt_eval_duration", 0)   # nanoseconds
+    if count < 256 or duration <= 0:
+        return
+    rate = count / (duration / 1e9)
+    _prefill_tps = rate if _prefill_tps is None else (_prefill_tps + rate) / 2
+
+
+def _post_trim_timeout(messages):
+    """Stall timeout for the one call right after a trim pass.
+
+    That call re-prefills the whole trimmed prompt in silence before its
+    first byte, so the ordinary STREAM_TIMEOUT stall detector would kill a
+    legitimate multi-minute CPU prefill (a fixed 900s constant once did,
+    at 92% done). Sized from what the prefill will actually cost: the
+    post-trim token estimate over the measured rate, with a safety factor
+    for the estimate erring low and the rate degrading as the window fills.
+    """
+    rate = _prefill_tps or config.PREFILL_TPS_FALLBACK
+    return max(config.STREAM_TIMEOUT,
+               int(_total_tokens(messages) / rate * config.POST_TRIM_TIMEOUT_FACTOR))
+
+
+def _stub_tool_outputs(messages, keep_last, start=0):
+    """Collapse oversized tool outputs (from `start` on) to one-line stubs,
+    keeping the `keep_last` most recent verbatim. Shared by trim_history's
+    soft pass and run_turn's turn-end cleanup so the marker format and skip
+    rules can't drift between them. Idempotent: a stub starts with
+    TRIM_PREFIX and is skipped on every later pass. Returns the number of
+    outputs collapsed, so callers can tell whether history (and therefore
+    the KV prefix cache) was actually edited."""
+    tool_idxs = [i for i, m in enumerate(messages)
+                 if i >= start and m.get("role") == "tool"]
+    old = tool_idxs[:-keep_last] if keep_last else tool_idxs
+    targets = [i for i in old
+               if not (messages[i].get("content") or "").startswith(config.TRIM_PREFIX)
+               and len(messages[i].get("content") or "") > config.TRIM_MIN_CHARS]
+    for i in targets:
+        m       = messages[i]
+        content = m.get("content", "")
+        nlines  = content.count("\n") + 1
+        m["content"] = (f"{config.TRIM_PREFIX}{m.get('name', 'tool')} — "
+                        f"was {nlines} lines, {len(content)} chars]")
+    return len(targets)
+
+
 def trim_history(messages):
-    """Collapse old tool outputs in place to conserve the context window.
+    """Shed context in place when the conversation approaches the window.
 
     Untouched history is free: it sits in the KV prefix cache and is never
     re-prefilled. Editing a message, by contrast, invalidates the cache from
-    the edit point on. So trimming is lazy — do nothing until the conversation
-    approaches the context window, then collapse every tool result outside the
-    keep-window in one pass. One cache bust per long session, not one per step.
+    the edit point on — and on an SWA model (gemma) the next call then
+    reprocesses the whole prompt from token 0, so the real cost of a trim
+    pass is the *post-trim prompt size*. Two consequences shape this design:
+    trimming is lazy (do nothing until the estimate crosses TRIM_AT_TOKENS,
+    then shed in one pass — one cache bust, not one per step), and a pass
+    sheds aggressively so the re-prefill it triggers is as small as possible.
+
+    A pass does two things: collapse every tool result outside the keep-window
+    to a plain stub, and drop `thinking` from all but the last
+    TRIM_KEEP_THINKING assistant messages that carry it. thinking only exists
+    on the live turn (drop_thinking clears it at every turn boundary), so the
+    latter sheds the current turn's older reasoning — on a long thinking-heavy
+    turn that's the bulk of the prompt, and stubs alone would leave the
+    post-trim re-prefill (and the window) dominated by it.
 
     The token estimate uses the ~4 chars/token heuristic; it only needs to be
     right to within the headroom left below NUM_CTX.
 
-    When SUMMARIZE_ON_TRIM is set, each collapsed output is first run through
-    summarize_output (a fresh session on the same model) so the kept stub is an
-    informative digest rather than a bare "[elided]" line. That fires a burst of
-    summarizer calls, but only here — at the already-expensive trim moment — so
-    short sessions pay nothing. On failure it falls back to the plain stub.
+    Idempotent: every collapsed/truncated message starts with TRIM_PREFIX and
+    is skipped on later passes, and a dropped thinking field is simply gone.
 
-    Idempotent by construction: every collapsed message is prefixed with
-    TRIM_PREFIX and skipped on later passes (a length check no longer suffices,
-    since a digest can be longer than TRIM_MIN_CHARS).
+    After the soft pass, a backstop hard-truncates any remaining oversized
+    message outside a protected recent tail. Stub-collapsing alone can't help
+    when the bloat is in long assistant/user messages, or when the keep-window
+    itself is what's oversized — without this, those cases silently overflow
+    NUM_CTX.
 
-    After collapsing eligible tool outputs, a backstop hard-truncates any
-    remaining oversized message outside a protected recent tail. Tool-output
-    collapsing alone can't help when the bloat is in long assistant/user
-    messages, or when the keep-window itself is what's oversized — without
-    this, those cases silently overflow NUM_CTX.
+    Returns True when this pass edited history — i.e. the KV prefix cache was
+    just busted and the next call will silently re-prefill the whole trimmed
+    prompt, so run_turn gives it a prefill-sized stall timeout and one retry.
+    Deliberately coarse on the hard-truncate path (reaching it almost always
+    edits something, and a false True merely stretches one call's timeout);
+    a False must be reliable, since that call keeps the short timeout.
     """
     if _total_tokens(messages) < config.TRIM_AT_TOKENS:
-        return
-    task = next((m["content"] for m in reversed(messages)
-                 if m.get("role") == "user"
-                 and m.get("content") not in (STEP_LIMIT_NUDGE, EMPTY_RETRY_NUDGE)), "")
-    tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-    old = tool_idxs[:-config.KEEP_FULL_TOOL_RESULTS] if config.KEEP_FULL_TOOL_RESULTS else tool_idxs
-    targets = [i for i in old
-               if not (messages[i].get("content") or "").startswith(config.TRIM_PREFIX)
-               and len(messages[i].get("content") or "") > config.TRIM_MIN_CHARS]
-    if targets:
-        config.console.print(f"[dim]compacting {len(targets)} old tool output"
-                      f"{'s' if len(targets) != 1 else ''}…[/dim]")
-        # Digesting is a serial CPU prefill per target; only the newest (most
-        # likely still task-relevant) targets are worth the wait. `targets` is
-        # in ascending message-index order, so the tail is the newest.
-        digest_at = set(targets[-config.MAX_TRIM_SUMMARIES:]) if config.MAX_TRIM_SUMMARIES else set()
-        # Circuit breaker: if the summarizer call fails once (server down,
-        # e.g. an OOM restart mid-trim), stop trying it for the rest of this
-        # pass — each further attempt would otherwise wait up to CMD_TIMEOUT
-        # against a server that isn't coming back in time.
-        summarizer_down = False
-        for i in targets:
-            m       = messages[i]
-            content = m.get("content", "")
-            name    = m.get("name", "tool")
-            nlines  = content.count("\n") + 1
-            marker  = f"{config.TRIM_PREFIX}{name} — was {nlines} lines, {len(content)} chars]"
-            summary = None
-            if config.SUMMARIZE_ON_TRIM and i in digest_at and not summarizer_down:
-                summary = summarize_output(name, content, task)
-                if summary is None:
-                    summarizer_down = True
-                    config.console.print("[dim]summarizer unavailable; using plain stubs for the rest of this pass[/dim]")
-            m["content"] = f"{marker}\n{summary}" if summary else marker
+        return False
+    stubbed = _stub_tool_outputs(messages, config.KEEP_FULL_TOOL_RESULTS)
+    if stubbed:
+        config.console.print(f"[dim]compacted {stubbed} old tool output"
+                      f"{'s' if stubbed != 1 else ''}[/dim]")
+
+    # Shed the live turn's older reasoning (see docstring). The keep-window
+    # counts only messages that still carry thinking, so the model always
+    # retains its most recent TRIM_KEEP_THINKING thoughts to build on.
+    thinking_idxs = [i for i, m in enumerate(messages)
+                     if m.get("role") == "assistant" and m.get("thinking")]
+    old_thinking = (thinking_idxs[:-config.TRIM_KEEP_THINKING]
+                    if config.TRIM_KEEP_THINKING else thinking_idxs)
+    for i in old_thinking:
+        messages[i].pop("thinking", None)
+    edited = bool(stubbed or old_thinking)
 
     if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:
-        return
+        return edited
     protected = set(range(max(0, len(messages) - config.KEEP_RECENT_MESSAGES), len(messages)))
     protected.add(0)   # system prompt
 
@@ -141,7 +194,7 @@ def trim_history(messages):
         marker = f"{config.TRIM_PREFIX}hard-truncated, was {len(content)} chars]"
         m["content"] = f"{marker}\n{content[:config.TRIM_MIN_CHARS]}"
         if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:
-            return
+            return True
 
     # Step 2: content alone wasn't enough — the overage is `thinking` fields
     # on protected (recent) messages, which step 1 never touches. Drop it
@@ -155,7 +208,7 @@ def trim_history(messages):
             continue
         messages[i].pop("thinking", None)
         if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:
-            return
+            return True
 
     # Step 3: still over budget — most likely the protected tail itself
     # (short contents, or the one thinking field we deliberately kept) is
@@ -164,6 +217,7 @@ def trim_history(messages):
         "[yellow]warning: context still exceeds the safety margin after "
         "trimming; the model may lose the system prompt[/yellow]"
     )
+    return True
 
 
 def drop_thinking(messages, start):
@@ -189,7 +243,7 @@ def _is_stray_nudge(m):
     run the same filter: a turn interrupted before strip_nudges ran (a
     Ctrl-C or a dropped connection propagating out of run_turn) can persist
     one of these into an autosaved session, and it would otherwise sit there
-    forever, including being handed to the summarizer as "the task".
+    forever.
     """
     if m.get("role") == "user" and m.get("content") in (STEP_LIMIT_NUDGE, EMPTY_RETRY_NUDGE):
         return True
@@ -228,7 +282,7 @@ def run_turn(messages, max_steps=20):
     turn_start = len(messages)
     try:
         while max_steps <= 0 or step < max_steps:
-            trim_history(messages)
+            trimmed = trim_history(messages)
             # Last allowed step: force an answer. We keep the tool schemas in the
             # payload (dropping them would shift the cached prefix and bust nearly
             # the whole prefill) and instead append a nudge at the *tail* — only its
@@ -237,7 +291,15 @@ def run_turn(messages, max_steps=20):
             if last:
                 messages.append({"role": "user", "content": STEP_LIMIT_NUDGE})
 
-            content, thinking, tool_calls, cancelled, stats = call_ollama(messages)
+            # A trim pass just busted the prefix cache, so this call re-prefills
+            # the whole trimmed prompt in silence — expected to take minutes on
+            # CPU. Give exactly this call a stall timeout sized to that prefill
+            # plus one retry (the server keeps its prefill progress, so a retry
+            # after a genuine stall resumes nearly free); the next loop
+            # iteration trims nothing (idempotent) and reverts to normal.
+            timeout = _post_trim_timeout(messages) if trimmed else None
+            content, thinking, tool_calls, cancelled, stats = call_ollama(
+                messages, timeout=timeout, retry_stall=trimmed)
 
             if cancelled:
                 # User aborted mid-stream. Drop the partial reply (don't commit
@@ -249,6 +311,7 @@ def run_turn(messages, max_steps=20):
                 calls += 1
                 for k, v in stats.items():
                     turn_stats[k] = turn_stats.get(k, 0) + v
+                _note_prefill_rate(stats)
 
             # On the forced final step we treat the reply as the answer and drop any
             # tool_calls it may still carry: we're out of budget, and storing
@@ -330,6 +393,22 @@ def run_turn(messages, max_steps=20):
         # it and leave stale thinking/nudges sitting in committed history.
         drop_thinking(messages, turn_start)
         strip_nudges(messages, turn_start)
+        # Also collapse the finished turn's oversized tool outputs, after
+        # strip_nudges (it rebuilds the list, shifting indices). On a
+        # thinking model drop_thinking above already busted the cache back
+        # to turn_start, so these edits cost no extra re-prefill — they
+        # shrink the one the next turn pays anyway. Completed turns stay
+        # lean, so long sessions reach each new task with a nearly-empty
+        # window instead of relying on a mid-turn trim later; the most
+        # recent results stay verbatim so an immediate follow-up ("now edit
+        # what you just read") still sees them. On a non-thinking model this
+        # is the sole turn-boundary edit — a bust bounded to the turn's own
+        # span, accepted for the same window-pressure reason.
+        stubbed = _stub_tool_outputs(messages, config.KEEP_FULL_TOOL_RESULTS,
+                                     start=turn_start)
+        if stubbed:
+            config.console.print(f"[dim]compacted {stubbed} tool output"
+                          f"{'s' if stubbed != 1 else ''} from this turn[/dim]")
 
 # --------------------------------------------------------------------------- #
 # CLI
@@ -511,7 +590,9 @@ def main():
             # opening the connection. Without this the process would crash.
             config.console.print(
                 f"[red]connection to Ollama stalled (no data for "
-                f"{config.STREAM_TIMEOUT}s): {e}[/red]"
+                f"{config.STREAM_TIMEOUT}s; the call after a trim pass gets "
+                f"a longer window sized to its re-prefill, and one retry): "
+                f"{e}[/red]"
             )
         except KeyboardInterrupt:
             config.console.print("\n[yellow]interrupted[/yellow]")
