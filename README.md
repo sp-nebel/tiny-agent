@@ -23,9 +23,13 @@ ollama pull gemma4:12b-it-qat   # or any tool-capable model
 
 ### Flash attention
 
-Flash attention is worth turning on explicitly, and it is **not something this agent can request**: Ollama resolves it when it loads the model, from the environment of the `ollama serve` process, and there is no per-request API option for it (a `flash_attn` key inside `options` is not a field Ollama parses — it is dropped). Ollama's own default is `auto`, which leaves the decision to llama.cpp; `OLLAMA_FLASH_ATTENTION=1` forces it on, `0` forces it off.
+Two things to know before turning it on, because the second one is counter-intuitive:
 
-Set it on the server, then restart the server:
+**It cannot be requested by this agent.** Ollama resolves flash attention when it loads the model, from the environment of the `ollama serve` process, and there is no per-request API option for it (a `flash_attn` key inside `options` is not a field Ollama parses — it is dropped). Ollama's own default is `auto`, which leaves the decision to llama.cpp; `OLLAMA_FLASH_ATTENTION=1` forces it on, `0` forces it off.
+
+**On CPU it does not speed up prefill — it costs throughput.** Flash attention's win is avoiding memory-bandwidth round-trips, which is a GPU problem; on CPU the fused kernel means the `KQ` and `KQV` matmuls stop going through llama.cpp's optimized GEMM path, and measured prompt processing gets *slower* — roughly 6% in mainline llama.cpp and up to 26% in ik_llama.cpp ([benchmark](https://github.com/ikawrakow/ik_llama.cpp/discussions/25)). Since this agent is built for machines with no GPU, flash attention here is a **memory** trade, not a speed one. Turn it on when the runner is OOM-killing (see "Surviving an Ollama restart mid-turn" below), not when prefill feels slow.
+
+If you do want it — it keeps the attention score matrix (batch × context, per head, which at `AGENT_NUM_CTX=24576` is not small) from being materialized in full, and it is the precondition for quantizing the K/V cache:
 
 ```bash
 # Linux, Ollama installed as a systemd service
@@ -33,20 +37,20 @@ sudo systemctl edit ollama
 # in the editor, add:
 #   [Service]
 #   Environment="OLLAMA_FLASH_ATTENTION=1"
-#   Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
 sudo systemctl restart ollama
 
 # macOS (desktop app or brew service) — then restart Ollama
 launchctl setenv OLLAMA_FLASH_ATTENTION 1
-launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
 
 # server started by hand
-OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve
+OLLAMA_FLASH_ATTENTION=1 ollama serve
 ```
 
-Why it is worth the trouble here: attention memory otherwise grows with the square of the context, and `AGENT_NUM_CTX` (24576 by default) is deliberately large so long sessions run without trimming. Flash attention is also the precondition for quantizing the K/V cache — `OLLAMA_KV_CACHE_TYPE=q8_0` roughly halves KV memory against the `f16` default, relieving exactly the runner-OOM pressure that `AGENT_NUM_CTX` otherwise has to be lowered for (see "Surviving an Ollama restart mid-turn" below). Set the two together; quantizing the cache without flash attention is not supported.
+`OLLAMA_KV_CACHE_TYPE=q8_0` halves KV memory again on top of that, but carries the same warning twice over: quantized K/V costs prompt-processing speed on CPU through per-token dequantization, and Gemma in particular has a [reported](https://github.com/ggml-org/llama.cpp/issues/12352) pathology there. Reach for it only under memory pressure, and measure the stats line before and after.
 
 Neither setting changes the bytes this agent sends, so prefix caching is unaffected by them. Restarting the server to apply them does drop the resident model and its prompt cache once — do that between sessions, not mid-task.
+
+**If prefill is what you actually want to improve**, the lever is the number of tokens prefilled, not the attention kernel: that is what prefix caching, lazy context and the trimming design exist for, and a large `prefill` count mid-session means a cache bust, not a slow kernel. See the Design notes.
 
 ## Usage
 
@@ -81,8 +85,8 @@ These two are read by the **Ollama server**, not by the agent — set them in `o
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OLLAMA_FLASH_ATTENTION` | `auto` | `1` forces flash attention on, `0` forces it off. Recommended: `1` |
-| `OLLAMA_KV_CACHE_TYPE` | `f16` | K/V cache quantization, e.g. `q8_0` to roughly halve KV memory. Requires flash attention |
+| `OLLAMA_FLASH_ATTENTION` | `auto` | `1` forces flash attention on, `0` forces it off. Saves memory; costs prompt-processing speed on CPU |
+| `OLLAMA_KV_CACHE_TYPE` | `f16` | K/V cache quantization, e.g. `q8_0` to roughly halve KV memory. Requires flash attention; slower still on CPU |
 
 ### Interactive commands
 
@@ -126,7 +130,7 @@ After each model turn a dim stats line is printed, e.g. `prefill 142 tok in 3.2s
 
 **Reasoning feedback** — a model's `thinking` output is carried on its assistant message and fed back on later tool round-trips *within* a turn, so it doesn't have to re-derive its chain of thought after every tool result. It's stripped once the turn produces a final answer (and, under mid-turn context pressure, trimming may shed all but the last few steps' thinking early — see above). On a thinking model, that strip busts the KV cache back to the start of the turn, so each multi-step turn re-prefills its own tool round-trips on the next turn — the "once per session" prefill claim above applies to the static system prompt and schemas, not to every token exchanged.
 
-**Flash attention** — a server-side setting, not a request option: Ollama picks it when it loads the model, so the agent cannot ask for it and the README's Setup section covers turning it on. It is worth doing because this agent deliberately runs a large `NUM_CTX`, and flash attention keeps attention memory from growing with the square of that window while also unlocking `OLLAMA_KV_CACHE_TYPE=q8_0`. Both are load-time properties of the resident model and leave the request bytes untouched, so neither costs a re-prefill once the server is up.
+**Flash attention** — a server-side setting, not a request option: Ollama picks it when it loads the model, so the agent cannot ask for it, and the README's Setup section covers turning it on. Worth being explicit about what it buys on this project's target hardware: it is a *memory* optimization, not a prefill speedup. Its benefit is avoiding memory-bandwidth round-trips, which is a GPU bottleneck; on a CPU-only box the fused kernel bypasses llama.cpp's optimized GEMM path and prompt processing measures slower with it on. So it belongs in the same bucket as lowering `NUM_CTX` — a remedy for a runner that is running out of memory — and not in the bucket with prefix caching and lazy context, which are what actually make prefill cheap here.
 
 **Surviving an Ollama restart mid-turn** — on a memory-constrained machine, a long session can OOM-kill the Ollama runner (host-memory prompt-cache state scales with resident context tokens). systemd typically restarts Ollama within seconds; if the next request hits that window as connection-refused, the agent waits `RETRY_REFUSED_DELAY` (5s) and retries once with the identical payload before giving up. Lower `AGENT_NUM_CTX` if OOM kills recur.
 

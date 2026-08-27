@@ -38,10 +38,11 @@ Env vars:
                           after a trim pass instead gets a timeout sized to its full re-prefill
 
 Ollama server env vars (read by `ollama serve`, not by this agent — flash attention
-is chosen when the model is loaded, so there is no per-request option for it):
-    OLLAMA_FLASH_ATTENTION  (Ollama default: auto) — set to 1 to force flash attention on
+is chosen when the model is loaded, so there is no per-request option for it). Both
+trade CPU prompt-processing speed for memory, so reach for them when the runner is
+OOM-killing, not to make prefill faster — see the README's Setup section:
+    OLLAMA_FLASH_ATTENTION  (Ollama default: auto) — 1 forces flash attention on
     OLLAMA_KV_CACHE_TYPE    (Ollama default: f16)  — e.g. q8_0 to halve KV memory; needs flash attention
-Set both, then restart Ollama. See the README's Setup section.
 
 Dependency: pip install rich
 Note: ensure Ollama >= 0.20.2 for reliable Gemma 4 tool-call parsing.
