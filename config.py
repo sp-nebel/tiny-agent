@@ -57,24 +57,29 @@ RETRY_REFUSED_DELAY = 5
 # single shot. Same head+tail-keeping shape as run_cmd's existing cap.
 MAX_TOOL_OUTPUT_CHARS = 8000
 
-# History trimming: collapse all but the N most recent tool outputs to a
-# one-line stub. This happens at two moments only, both already-paid cache
-# busts (editing history invalidates the KV prefix cache from the edit point
-# on, so it must never happen per step): at every turn boundary for the
-# finished turn's outputs (piggybacked on drop_thinking's bust), and mid-turn
-# in one lazy pass when the estimate crosses TRIM_AT_TOKENS. Only outputs
+# History trimming: collapse old tool outputs to one-line stubs. This happens
+# at two moments only, both already-paid cache busts (editing history
+# invalidates the KV prefix cache from the edit point on, so it must never
+# happen per step): at every turn boundary for the finished turn's outputs
+# (piggybacked on drop_thinking's bust), keeping the N most recent verbatim
+# for follow-up tasks — after the turn its thinking is stripped, so those
+# outputs are the only remaining record; and mid-turn in one lazy pass when
+# the estimate crosses TRIM_AT_TOKENS, where every already-processed output
+# collapses (the live turn's thinking holds their distilled facts) and only
+# the trailing results the model hasn't seen yet stay verbatim. Only outputs
 # over the threshold collapse.
 KEEP_FULL_TOOL_RESULTS = 3
 TRIM_MIN_CHARS         = 400
 TRIM_AT_TOKENS         = int(NUM_CTX * 0.7)
 
-# Assistant messages (counted from the tail) whose `thinking` a mid-turn trim
-# pass leaves intact. thinking only exists on the live turn's messages, so
-# this sheds the current turn's *older* reasoning while keeping what the model
-# is actively building on. On a thinking-heavy turn that old thinking — which
-# stub-collapsing never touches — is the bulk of what must go to make the
-# post-trim re-prefill cheap: the cost of a trim bust is the post-trim prompt
-# size, since SWA models reprocess from token 0 after any edit. The
+# Fallback floor for the mid-turn pass: thinking is preferentially kept (it is
+# the model's distilled record of the outputs stubbed away), but when stubbing
+# alone can't get the estimate back under TRIM_AT_TOKENS — a marathon turn
+# whose thinking is itself the bulk — all but this many thinking fields are
+# shed too. Without the fallback the estimate would sit above the trigger
+# forever and every later step would stub its one new output: a cache bust and
+# a full re-prefill per step. The cost of any bust is the post-trim prompt
+# size, since SWA models reprocess from token 0 after an edit; the
 # hard-truncate backstop escalates further, to only the single most recent.
 TRIM_KEEP_THINKING = 4
 

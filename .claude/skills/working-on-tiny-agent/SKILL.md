@@ -23,8 +23,9 @@ read `verifying-tiny-agent`.
   prefix), plus all caps/thresholds. New knobs go here, env-var overridable where users might
   need them (`AGENT_*` naming).
 - `agent.py` — the loop. `run_turn` (one user task: repeated model calls + tool round-trips),
-  `trim_history` (lazy mid-turn context shedding: tool-output stubs + old-thinking drop +
-  hard-truncate backstop; returns True when it edited history, which gives the next call a
+  `trim_history` (lazy mid-turn context shedding: stubs every already-processed tool output,
+  sheds old thinking only as a fallback when that isn't enough, then the hard-truncate
+  backstop; returns True when it edited history, which gives the next call a
   prefill-sized stall timeout and one retry), `_stub_tool_outputs` (shared stub helper),
   `drop_thinking` and `strip_nudges` (turn-boundary cleanup, invoked from `run_turn`'s
   `finally`, which also stubs the finished turn's oversized tool outputs), `main()` (CLI +

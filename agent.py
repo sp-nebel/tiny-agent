@@ -128,13 +128,13 @@ def trim_history(messages):
     then shed in one pass — one cache bust, not one per step), and a pass
     sheds aggressively so the re-prefill it triggers is as small as possible.
 
-    A pass does two things: collapse every tool result outside the keep-window
-    to a plain stub, and drop `thinking` from all but the last
-    TRIM_KEEP_THINKING assistant messages that carry it. thinking only exists
-    on the live turn (drop_thinking clears it at every turn boundary), so the
-    latter sheds the current turn's older reasoning — on a long thinking-heavy
-    turn that's the bulk of the prompt, and stubs alone would leave the
-    post-trim re-prefill (and the window) dominated by it.
+    A pass sheds in priority order: first collapse every tool result the model
+    has already replied to (its kept thinking is the distilled record of them,
+    and raw reads are the biggest single contributor), then — only if that
+    alone doesn't get back under the trigger — drop `thinking` from all but
+    the last TRIM_KEEP_THINKING assistant messages that carry it. thinking
+    only exists on the live turn (drop_thinking clears it at every turn
+    boundary), so that fallback sheds the current turn's older reasoning.
 
     The token estimate uses the ~4 chars/token heuristic; it only needs to be
     right to within the headroom left below NUM_CTX.
@@ -157,21 +157,42 @@ def trim_history(messages):
     """
     if _total_tokens(messages) < config.TRIM_AT_TOKENS:
         return False
-    stubbed = _stub_tool_outputs(messages, config.KEEP_FULL_TOOL_RESULTS)
+    # A tool result is disposable as soon as the model has replied to it: the
+    # reply's thinking (kept for the whole turn) already carries the distilled
+    # facts, while the raw output — often a capped-but-huge file read — is the
+    # bulk of the window. So stub every result the model has processed, and
+    # keep only the trailing ones after the last assistant message: those it
+    # has not seen yet and is about to act on — stub one of them and the model
+    # acts on a placeholder.
+    last_asst = next((i for i in range(len(messages) - 1, -1, -1)
+                      if messages[i].get("role") == "assistant"), 0)
+    unseen  = sum(1 for m in messages[last_asst:] if m.get("role") == "tool")
+    stubbed = _stub_tool_outputs(messages, unseen)
     if stubbed:
         config.console.print(f"[dim]compacted {stubbed} old tool output"
                       f"{'s' if stubbed != 1 else ''}[/dim]")
 
-    # Shed the live turn's older reasoning (see docstring). The keep-window
-    # counts only messages that still carry thinking, so the model always
-    # retains its most recent TRIM_KEEP_THINKING thoughts to build on.
-    thinking_idxs = [i for i, m in enumerate(messages)
-                     if m.get("role") == "assistant" and m.get("thinking")]
-    old_thinking = (thinking_idxs[:-config.TRIM_KEEP_THINKING]
-                    if config.TRIM_KEEP_THINKING else thinking_idxs)
-    for i in old_thinking:
-        messages[i].pop("thinking", None)
-    edited = bool(stubbed or old_thinking)
+    # Thinking is the model's distilled record of everything stubbed above, so
+    # it survives the pass whenever stubbing alone gets the estimate back under
+    # the trigger. When it doesn't — a marathon turn whose thinking IS the bulk
+    # — shed all but the last TRIM_KEEP_THINKING fields too. Without this
+    # escape valve the estimate would sit above TRIM_AT_TOKENS forever and
+    # every later step would stub its one newly-processed output: a cache bust
+    # and a full re-prefill per step, the exact pattern trimming exists to
+    # avoid (the only other relief is the ~90% backstop below, which drops old
+    # thinking far more brutally).
+    dropped = 0
+    if _total_tokens(messages) >= config.TRIM_AT_TOKENS:
+        thinking_idxs = [i for i, m in enumerate(messages)
+                         if m.get("role") == "assistant" and m.get("thinking")]
+        old_thinking = (thinking_idxs[:-config.TRIM_KEEP_THINKING]
+                        if config.TRIM_KEEP_THINKING else thinking_idxs)
+        for i in old_thinking:
+            messages[i].pop("thinking", None)
+        dropped = len(old_thinking)
+        if dropped:
+            config.console.print("[dim]shed older thinking to fit the window[/dim]")
+    edited = bool(stubbed or dropped)
 
     if _total_tokens(messages) < config.HARD_TRUNCATE_AT_TOKENS:
         return edited

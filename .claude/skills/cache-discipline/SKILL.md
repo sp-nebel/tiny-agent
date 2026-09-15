@@ -35,9 +35,10 @@ state its cache impact.** If you can't state it, you don't understand the change
 3. **Cache busts are only allowed at already-expensive, bounded moments:**
    - `trim_history`: once per pass, only when the estimate crosses `TRIM_AT_TOKENS`. It
      deliberately does nothing before that ("untouched history is free"), and when it does
-     fire it sheds aggressively (tool-output stubs + old thinking) because the cost of the
-     bust is the *post-trim prompt size* — SWA models (gemma) re-prefill from token 0 after
-     any edit.
+     fire it sheds in priority order — every already-processed tool output first (the live
+     turn's thinking is their distilled record), old thinking only as a fallback when stubs
+     alone can't get back under the trigger — because the cost of the bust is the
+     *post-trim prompt size*: SWA models (gemma) re-prefill from token 0 after any edit.
    - `drop_thinking` / `strip_nudges` / turn-end tool-output stubbing: once per turn
      boundary, in `run_turn`'s `finally`. The stubbing piggybacks on drop_thinking's
      existing bust, so on a thinking model it adds no re-prefill of its own.
