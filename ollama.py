@@ -7,7 +7,7 @@ import urllib.error
 from rich.live import Live
 
 import config
-from ui import cbreak_stdin, cancel_pressed, _render_stream
+from ui import cbreak_stdin, poll_keypress, read_interjection, _render_stream
 
 # --------------------------------------------------------------------------- #
 # Ollama call  (streaming, native tool-call detection)
@@ -64,9 +64,14 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
     also returned, so run_turn can carry it on the assistant message and feed
     it back on the next step — keeping the model's chain of thought intact
     across tool round-trips until a final answer lands. cancelled is True if
-    the user pressed the cancel key (Esc/q) mid-stream; stats is a dict of raw
+    the user pressed Esc mid-stream; stats is a dict of raw
     token counters from the final chunk, empty ({}) in that case (the final
     chunk never arrived) — run_turn sums it across the turn.
+
+    Any other key, polled the same way, opens a prompt for a mid-reply message
+    to the model; that text is queued in ui (see read_interjection) rather than
+    returned, so the retry paths above can't discard it along with the partial
+    stream they throw away.
     """
     payload = _build_payload(messages, stream=True, tools=True, think=config.THINK)
     req = _chat_request(payload)
@@ -118,16 +123,25 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
                                    _retried_refused=True)
             raise
 
-        # cbreak lets us catch a single cancel keypress without blocking the
-        # stream; transient=True clears the live region (thinking included)
-        # when done, so run_turn re-renders the content it kept — a final
-        # answer or a mid-turn update — while the thinking stays wiped.
+        # cbreak lets us catch a single keypress — Esc to cancel, anything
+        # else to interject — without blocking the stream; transient=True
+        # clears the live region (thinking included) when done, so run_turn
+        # re-renders the content it kept — a final answer or a mid-turn
+        # update — while the thinking stays wiped.
         with resp, cbreak_stdin():
             with Live(console=config.console, refresh_per_second=8, transient=True) as live:
                 for raw in resp:
-                    if cancel_pressed():
+                    action, seed = poll_keypress()
+                    if action == "cancel":
                         cancelled = True
                         break
+                    if action == "interject":
+                        # Queued in ui, not returned: the retry paths above
+                        # discard this stream and start over, and the message
+                        # must survive that. run_turn drains the queue at the
+                        # next step boundary.
+                        read_interjection(live, seed,
+                                          _render_stream(thinking, content))
 
                     raw = raw.strip()
                     if not raw:

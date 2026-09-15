@@ -11,7 +11,8 @@ from rich.markdown import Markdown
 import config
 from tools import dispatch
 from ollama import call_ollama, warm_cache
-from ui import read_prompt, fmt_args, truncate, fmt_stats
+from ui import (read_prompt, fmt_args, truncate, fmt_stats,
+                take_interjections, interjections_pending)
 from session import *
 
 try:                      # line editing + history for the interactive prompt
@@ -36,6 +37,30 @@ STEP_LIMIT_NUDGE = (
 # answer; the retry simply re-enters the loop. Tail-only, so the cache is intact.
 EMPTY_RETRY_NUDGE = "[your last reply was empty — please continue.]"
 MAX_EMPTY_RETRIES = 2
+
+# Marks a message the user typed while the model was mid-task (see
+# ui.read_interjection), so the model reads it as a new instruction arriving
+# during the work rather than as a fresh, unrelated task. Same shape as the
+# nudges above — a bracketed lead-in on an appended user message.
+INTERJECTION_PREFIX = "[user message sent mid-task] "
+
+
+def deliver_interjections(messages):
+    """Append whatever the user typed during the last step.
+
+    Appended at the tail, like the nudges, so only its own tokens prefill and
+    the cached prefix is untouched. Called at a step boundary and nowhere
+    else: an assistant message carrying tool_calls must be followed straight
+    away by one tool result per call, so a user message slipped in between
+    would corrupt history for every later request.
+    """
+    queued = take_interjections()
+    for text in queued:
+        messages.append({"role": "user", "content": INTERJECTION_PREFIX + text})
+        # The echoed `interject` line sits wherever the user happened to type
+        # it; print it again here, where it actually enters the conversation —
+        # after the tool results of the step it was typed during.
+        config.console.print(f"[bold green]you[/bold green] {text}")
 
 
 def _msg_tokens(m):
@@ -303,6 +328,7 @@ def run_turn(messages, max_steps=20):
     turn_start = len(messages)
     try:
         while max_steps <= 0 or step < max_steps:
+            deliver_interjections(messages)
             trimmed = trim_history(messages)
             # Last allowed step: force an answer. We keep the tool schemas in the
             # payload (dropping them would shift the cached prefix and bust nearly
@@ -359,7 +385,11 @@ def run_turn(messages, max_steps=20):
                 # forced last step (out of budget) and not once the cap is hit.
                 if not content.strip() and not last and empty_retries < MAX_EMPTY_RETRIES:
                     empty_retries += 1
-                    messages.append({"role": "user", "content": EMPTY_RETRY_NUDGE})
+                    # A queued interjection is itself a continuation prompt, and
+                    # the next iteration delivers it — a nudge in front of it
+                    # would only be a second, vaguer user message in a row.
+                    if not interjections_pending():
+                        messages.append({"role": "user", "content": EMPTY_RETRY_NUDGE})
                     continue
 
                 # Final answer (normal early finish, or the forced last step).
@@ -519,8 +549,9 @@ def main():
     config.console.print(f"[bold]tiny-agent[/bold] · {config.MODEL} · {os.getcwd()}")
     config.console.print(
         "[dim]model warms up in the background; the first reply is slow if it "
-        "hasn't finished. later turns reuse the KV cache. press Esc/q to "
-        "cancel a reply, '/clear' to reset context, '/save', '/resume', "
+        "hasn't finished. later turns reuse the KV cache. while a reply "
+        "streams, just start typing to send the model a message; Esc "
+        "cancels the reply. '/clear' to reset context, '/save', '/resume', "
         "'/sessions' to pause/switch conversations (each takes an optional "
         "name), 'exit' to quit.[/dim]\n"
     )
@@ -629,4 +660,12 @@ def main():
             )
         except KeyboardInterrupt:
             config.console.print("\n[yellow]interrupted[/yellow]")
+
+        # Anything typed during the turn's last step never reached a step
+        # boundary — the turn ended first (final answer, cancel, step limit, or
+        # an error out of run_turn). Rather than swallow it, carry it over as
+        # the next prompt; `initial` prints it and runs it like a typed one.
+        leftover = take_interjections()
+        if leftover:
+            initial = "\n".join(leftover)
         config.console.print()

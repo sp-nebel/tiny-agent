@@ -59,8 +59,11 @@ python local_agent.py
 | `/save [NAME]` | Save the current conversation as a session (defaults to a timestamp) |
 | `/resume [NAME]` | Resume a saved session; bare `/resume` resumes the most recent |
 | `/sessions` | List saved sessions |
-| Esc / `q` / `Q` during a reply | Cancel the in-flight response |
+| Any key during a reply | Pauses the stream and opens an `interject` prompt for a message to the model; the key you typed becomes the first character of the line. Delivered at the next step boundary (after the current tool round-trip finishes), or as the next prompt if the turn ends first. Submit an empty line to think better of it |
+| Esc during a reply | Cancel the in-flight response |
 | Up / Down arrows | Recall previous prompts (history persists in `~/.tiny_agent_history`) |
+
+Esc is the only key that cancels, and only on its own: arrow keys and other escape sequences are drained rather than read as a cancel. Keys are polled once per arriving chunk, so during the silent re-prefill after a trim pass nothing is seen until generation starts, and a multi-line paste into a stream arrives as one interjection per line.
 
 ## Tools available to the model
 
@@ -74,7 +77,7 @@ python local_agent.py
 | `edit_file` | Exact-string replacement edit, or create a new file |
 | `run_cmd` | Run a shell command |
 
-`edit_file` and `run_cmd` ask for confirmation before executing unless `--yes` is passed. Edits show a colored unified diff before the confirmation prompt (and under `--yes`, as a record of what changed).
+`edit_file` and `run_cmd` ask for confirmation before executing unless `--yes` is passed. Edits show a colored unified diff before the confirmation prompt (and under `--yes`, as a record of what changed). The prompt is `[y/N/reason]`: `y` approves, empty/`n` declines, and anything else declines *and* is passed back to the model as the reason — `use the test runner, not python directly` redirects it, where a bare refusal tends to make a small model re-issue the identical call.
 
 **Security note:** `--yes` auto-approves every write and shell command with no confirmation, and `run_cmd` executes with `shell=True`, so the model can run anything a real shell command can. Only use `--yes` in a repo/directory you trust the agent with.
 
@@ -95,5 +98,7 @@ After each model turn a dim stats line is printed, e.g. `prefill 142 tok in 3.2s
 **Reasoning feedback** — a model's `thinking` output is carried on its assistant message and fed back on later tool round-trips *within* a turn, so it doesn't have to re-derive its chain of thought after every tool result. It's stripped once the turn produces a final answer (and, under mid-turn context pressure, trimming may shed all but the last few steps' thinking early — though only as a fallback when stubbing tool outputs alone isn't enough, see above). On a thinking model, that strip busts the KV cache back to the start of the turn, so each multi-step turn re-prefills its own tool round-trips on the next turn — the "once per session" prefill claim above applies to the static system prompt and schemas, not to every token exchanged.
 
 **Surviving an Ollama restart mid-turn** — on a memory-constrained machine, a long session can OOM-kill the Ollama runner (host-memory prompt-cache state scales with resident context tokens). systemd typically restarts Ollama within seconds; if the next request hits that window as connection-refused, the agent waits `RETRY_REFUSED_DELAY` (5s) and retries once with the identical payload before giving up. Lower `AGENT_NUM_CTX` if OOM kills recur.
+
+**Interjections** — any keypress during a reply opens a prompt for a message to the model (Esc alone still cancels). What you type is queued, not injected: the model is already generating, and an assistant message carrying `tool_calls` must be followed immediately by its tool results, so slipping a user message in between would corrupt history. The queue is drained at the next step boundary — after the current round-trip's tool results, before the next model call — and appended there as an ordinary user message marked `[user message sent mid-task]`, the same tail-append shape as the step-limit and empty-reply nudges, so only its own tokens prefill and the cached prefix is untouched. If the turn ends before the next boundary (final answer, cancel, step limit, or a connection error), whatever is still queued becomes the next prompt instead of being swallowed. Because `cbreak` echo is off, the key that opened the prompt would otherwise be lost, so it is pre-filled into the line — typing straight into a stream keeps every character, which is what made `q` safe to drop as a second cancel key.
 
 **Native tool calling** — tools are passed via Ollama's `tools` parameter as JSON schemas, not described in the system prompt, so the model uses the format it was actually trained on.

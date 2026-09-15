@@ -29,6 +29,11 @@ Usage:
     python local_agent.py "review the null handling in AuthService"
     python local_agent.py            # interactive; seed a task at the prompt
 
+While a reply streams: any keypress opens a prompt for a message to the model
+(queued and delivered at the next step boundary, so the cached prefix is
+untouched), Esc alone cancels the reply. A declined edit or command can carry
+a reason, which is handed to the model in place of a bare refusal.
+
 Env vars:
     AGENT_MODEL           (default: gemma4:12b-it-qat)   — any Ollama model with tool support
     OLLAMA_URL            (default: http://localhost:11434)

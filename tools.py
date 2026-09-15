@@ -13,14 +13,37 @@ import config
 # Tools (implementations)
 # --------------------------------------------------------------------------- #
 
-def confirm(msg: str) -> bool:
+def confirm(msg: str):
+    """Ask before a destructive action. Returns (approved, reason).
+
+    Anything that isn't a yes or a bare no is taken as a denial *with a
+    reason*, which the caller hands back to the model: "use the test runner,
+    not python directly" turns a dead end into a redirect, where a plain
+    refusal just invites the same call again.
+    """
     if config.AUTO_YES:
-        return True
+        return True, ""
     try:
-        ans = config.console.input(f"[yellow]{msg}[/yellow] [y/N] ").strip().lower()
+        ans = config.console.input(f"[yellow]{msg}[/yellow] [y/N/reason] ").strip()
     except (EOFError, KeyboardInterrupt):
-        return False
-    return ans in ("y", "yes")
+        return False, ""
+    if ans.lower() in ("y", "yes"):
+        return True, ""
+    if ans.lower() in ("", "n", "no"):
+        return False, ""
+    return False, ans
+
+
+def declined(what: str, reason: str) -> str:
+    """Tool result for a refused action, with the user's reason when given.
+
+    The imperative tail is deliberate: a small model reading only
+    "[user declined write]" tends to re-issue the identical call.
+    """
+    if not reason:
+        return f"[user declined {what}]"
+    return (f"[user declined {what}. Their reason: {reason}. Follow it and "
+            f"change your approach; do not repeat the same call.]")
 
 
 def show_diff(old: str, new: str, path: str, max_lines: int = 60):
@@ -264,8 +287,9 @@ def edit_file(path, old_string, new_string, replace_all=False):
         if os.path.exists(path):
             return f"[{path} already exists; put the text to replace in old_string]"
         show_diff("", new_string, path)
-        if not confirm(f"create {path} ({len(new_string)} chars)?"):
-            return "[user declined write]"
+        ok, reason = confirm(f"create {path} ({len(new_string)} chars)?")
+        if not ok:
+            return declined("write", reason)
         try:
             parent = os.path.dirname(path)
             if parent:
@@ -306,8 +330,9 @@ def edit_file(path, old_string, new_string, replace_all=False):
     new_content = content.replace(old_string, new_string, -1 if replace_all else 1)
     plural      = "s" if n != 1 else ""
     show_diff(content, new_content, path)
-    if not confirm(f"edit {path} ({n} replacement{plural})?"):
-        return "[user declined write]"
+    ok, reason = confirm(f"edit {path} ({n} replacement{plural})?")
+    if not ok:
+        return declined("write", reason)
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
@@ -317,8 +342,9 @@ def edit_file(path, old_string, new_string, replace_all=False):
 
 
 def run_cmd(cmd):
-    if not confirm(f"run: {cmd}"):
-        return "[user declined command]"
+    ok, reason = confirm(f"run: {cmd}")
+    if not ok:
+        return declined("command", reason)
     try:
         out = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=config.CMD_TIMEOUT
