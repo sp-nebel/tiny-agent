@@ -79,8 +79,10 @@ def _render_stream(thinking: str, content: str) -> Text:
     """Build the live view: reasoning above the answer-so-far, both dim.
 
     Lives only in the transient Live region, so when the stream finishes the
-    whole thing — thinking included — is wiped and run_turn re-renders just
-    the final content as Markdown.
+    whole thing is wiped and run_turn re-renders the content as Markdown —
+    a final answer and a mid-turn update alike, so nothing the model wrote
+    for the user is lost. Only the reasoning stays wiped: it is scratch work,
+    not something addressed to the reader.
 
     The reasoning is shown through a sliding window over its tail: Rich's Live
     region crops anything taller than the terminal from the *bottom*, which

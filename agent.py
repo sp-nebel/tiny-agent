@@ -352,6 +352,18 @@ def run_turn(messages, max_steps=20):
                     config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
                 return
 
+            # The model addressed the user before calling its tools. That text
+            # streamed only into the transient Live region, which is wiped when
+            # the stream ends, so without re-rendering it here the update would
+            # vanish the moment the tool lines print — the same disposal
+            # `thinking` gets. Thinking is scratch work and earns that; a
+            # mid-turn update is written *for the user*, so it stays on screen,
+            # above the tool calls it explains. Display only: the text is
+            # already committed to assistant_msg either way, so history — and
+            # the prefix cache — are untouched.
+            if content.strip():
+                config.console.print(Markdown(content))
+
             # Execute each requested tool and feed results back. The finally
             # block appends stub results for any calls that never ran (e.g.
             # Ctrl-C mid-tool), so the history never carries an assistant
