@@ -120,7 +120,8 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
 
         # cbreak lets us catch a single cancel keypress without blocking the
         # stream; transient=True clears the live region (thinking included)
-        # when done, so run_turn re-renders only the final answer.
+        # when done, so run_turn re-renders the content it kept — a final
+        # answer or a mid-turn update — while the thinking stays wiped.
         with resp, cbreak_stdin():
             with Live(console=config.console, refresh_per_second=8, transient=True) as live:
                 for raw in resp:
