@@ -83,11 +83,15 @@ Run `python3 local_agent.py` and exercise:
 - `/clear` — next stats line should still show a small prefill (system prompt stayed cached).
 - `/save foo` then `/resume foo` — round-trips via `~/.tiny_agent_sessions/foo.json`;
   `/sessions` lists it with a `*` on the active one.
-- Esc or `q` during a streaming reply — prints `cancelled`, returns to the prompt, and the
+- Esc during a streaming reply — prints `cancelled`, returns to the prompt, and the
   partial reply is NOT in history (ask a follow-up to confirm the model never saw it).
 - Ctrl-C while a tool is running — the turn aborts but history stays well-formed
   (stub `[interrupted before this tool ran]` results pair up any pending tool_calls).
 - A multi-line paste arrives as one prompt, not one prompt per line.
+- Ask for a long file edit: while the tool call is composed silently, the live region shows
+  `generating… Ns without visible output` after ~2s and Esc still cancels. The next prompt
+  must answer promptly — if it hangs for minutes, the abandoned generation wasn't torn down
+  (`ollama._abort_stream`).
 
 ## 5. Doc sync (always, for user-visible changes)
 

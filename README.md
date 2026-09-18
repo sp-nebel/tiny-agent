@@ -63,7 +63,9 @@ python local_agent.py
 | Esc during a reply | Cancel the in-flight response |
 | Up / Down arrows | Recall previous prompts (history persists in `~/.tiny_agent_history`) |
 
-Esc is the only key that cancels, and only on its own: arrow keys and other escape sequences are drained rather than read as a cancel. Keys are polled once per arriving chunk, so during the silent re-prefill after a trim pass nothing is seen until generation starts, and a multi-line paste into a stream arrives as one interjection per line.
+Esc is the only key that cancels, and only on its own: arrow keys and other escape sequences are drained rather than read as a cancel. Once a reply has started streaming, keys are polled every quarter second whether or not anything arrives. Before that — during the silent re-prefill after a trim pass, when Ollama hasn't sent even the response headers yet — nothing is seen until generation starts. A multi-line paste into a stream arrives as one interjection per line.
+
+While the model composes a tool call nothing streams — Ollama sends the call as one piece when it is complete — so after a couple of silent seconds the live region shows an elapsed-time notice instead of freezing, and the keys keep working throughout. Cancelling in that phase shuts the connection down outright, so Ollama stops generating the abandoned call instead of making your next request wait behind it.
 
 ## Tools available to the model
 

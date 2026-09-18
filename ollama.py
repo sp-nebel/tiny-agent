@@ -1,6 +1,9 @@
 import json
 import time
+import queue
 import socket
+import threading
+import http.client
 import urllib.request
 import urllib.error
 
@@ -35,6 +38,83 @@ def _build_payload(messages, *, stream, tools=True, think=False, num_predict=Non
     if think:
         payload["think"] = True
     return payload
+
+
+_EOF = object()
+
+
+def _iter_with_ticks(resp, tick=0.25):
+    """Yield the response's lines as they arrive, and None once per `tick`
+    of silence in between.
+
+    Ollama parses a tool call server-side and sends it as one chunk when it
+    is complete, so while the model composes a long edit nothing arrives for
+    minutes. A plain `for raw in resp` blocks inside the socket read for that
+    whole time: the live region freezes with no sign of life, and — since
+    keys are only polled per chunk — Esc and typing go dead in exactly the
+    phase where the user most wants them. Reading on a helper thread and
+    handing lines over a queue lets the caller wake up every tick to poll
+    keys and repaint an elapsed-time notice.
+
+    Errors from the read (the socket stall timeout included — urlopen's
+    timeout still governs the underlying socket) are re-raised on the
+    caller's thread as the same exception object, so call_ollama's
+    `except socket.timeout` stall handling is unchanged. The queue is
+    unbounded so the pump never blocks on a consumer that has gone away; the
+    thread is a daemon, and a caller that stops early must _abort_stream the
+    response so the pump's blocked read actually returns (see there).
+    """
+    q = queue.Queue()
+
+    def pump():
+        try:
+            for line in resp:
+                q.put(line)
+        # AttributeError is the abort race, not a bug to surface: after an
+        # _abort_stream the caller's `with resp` sets resp.fp to None while
+        # this read is still unwinding, and http.client's own cleanup then
+        # calls None.close(). Uncaught it would print a thread traceback
+        # over the live view.
+        except (OSError, ValueError, AttributeError, http.client.HTTPException) as e:
+            q.put(e)    # after an _abort_stream nobody reads this; it just drops
+        q.put(_EOF)
+
+    threading.Thread(target=pump, daemon=True).start()
+    while True:
+        try:
+            item = q.get(timeout=tick)
+        except queue.Empty:
+            yield None
+            continue
+        if item is _EOF:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
+def _abort_stream(resp):
+    """Tear the connection down under a pump thread still blocked in recv().
+
+    Closing the response isn't enough once _iter_with_ticks reads on another
+    thread: on Linux, close() on an fd doesn't wake a recv() blocked on it in
+    a different thread, and the in-flight syscall keeps the socket alive, so
+    no FIN goes out. While tokens stream the next chunk unblocks the pump
+    soon enough — but during a silent tool-call composition, exactly when
+    Esc is now usable, Ollama would keep generating the discarded call for
+    minutes, and with a single slot the next request (the next prompt) would
+    queue behind it. shutdown() wakes the blocked recv and sends the FIN.
+
+    Called only where call_ollama abandons a live stream, never on normal
+    completion: after the final chunk resp.fp is already None, and a
+    shutdown on a finished connection can raise ENOTCONN. `_sock` is private
+    to the socket's file wrapper, hence the AttributeError fallthrough to
+    the plain close that `with resp` does anyway.
+    """
+    try:
+        resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+    except (AttributeError, OSError):
+        pass
 
 
 def _chat_request(payload):
@@ -84,6 +164,7 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
     cancelled  = False
     stats      = {}
     last_paint = 0.0
+    last_data  = time.monotonic()
 
     # The outer try exists for the post-trim stall retry: the silent prefill
     # can time out either while waiting for the response headers (Ollama
@@ -129,62 +210,81 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
         # re-renders the content it kept — a final answer or a mid-turn
         # update — while the thinking stays wiped.
         with resp, cbreak_stdin():
-            with Live(console=config.console, refresh_per_second=8, transient=True) as live:
-                for raw in resp:
-                    action, seed = poll_keypress()
-                    if action == "cancel":
-                        cancelled = True
-                        break
-                    if action == "interject":
-                        # Queued in ui, not returned: the retry paths above
-                        # discard this stream and start over, and the message
-                        # must survive that. run_turn drains the queue at the
-                        # next step boundary.
-                        read_interjection(live, seed,
-                                          _render_stream(thinking, content))
+            try:
+                with Live(console=config.console, refresh_per_second=8, transient=True) as live:
+                    for raw in _iter_with_ticks(resp):
+                        # Keys first, on idle ticks too: a silent tool-call
+                        # composition is when the user most wants them.
+                        action, seed = poll_keypress()
+                        if action == "cancel":
+                            cancelled = True
+                            _abort_stream(resp)
+                            break
+                        if action == "interject":
+                            # Queued in ui, not returned: the retry paths above
+                            # discard this stream and start over, and the message
+                            # must survive that. run_turn drains the queue at the
+                            # next step boundary.
+                            read_interjection(live, seed,
+                                              _render_stream(thinking, content))
 
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    try:
-                        obj = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue   # malformed chunk (e.g. server hiccup) — skip it
-                    msg = obj.get("message", {})
+                        if raw is None:
+                            # Idle tick: nothing arrived. Repaint with how long the
+                            # silence has lasted so a long tool call in progress
+                            # doesn't look like a hang.
+                            live.update(_render_stream(thinking, content,
+                                                       quiet_s=time.monotonic() - last_data))
+                            continue
+                        last_data = time.monotonic()
 
-                    # Reasoning streams in its own field (models that emit it).
-                    tdelta = msg.get("thinking", "")
-                    if tdelta:
-                        thinking += tdelta
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            obj = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue   # malformed chunk (e.g. server hiccup) — skip it
+                        msg = obj.get("message", {})
 
-                    # The actual answer / final text content.
-                    delta = msg.get("content", "")
-                    if delta:
-                        content += delta
+                        # Reasoning streams in its own field (models that emit it).
+                        tdelta = msg.get("thinking", "")
+                        if tdelta:
+                            thinking += tdelta
 
-                    # Rebuilding the renderable is O(accumulated text), so doing
-                    # it per chunk goes quadratic and steals CPU from inference.
-                    # Live paints at 8 fps anyway; skip updates it would never show.
-                    if (tdelta or delta) and time.monotonic() - last_paint >= 0.12:
-                        live.update(_render_stream(thinking, content))
-                        last_paint = time.monotonic()
+                        # The actual answer / final text content.
+                        delta = msg.get("content", "")
+                        if delta:
+                            content += delta
 
-                    # Tool calls appear in a dedicated field, often in a chunk
-                    # where content is empty.
-                    tcs = msg.get("tool_calls", [])
-                    if tcs:
-                        tool_calls.extend(tcs)
+                        # Rebuilding the renderable is O(accumulated text), so doing
+                        # it per chunk goes quadratic and steals CPU from inference.
+                        # Live paints at 8 fps anyway; skip updates it would never show.
+                        if (tdelta or delta) and time.monotonic() - last_paint >= 0.12:
+                            live.update(_render_stream(thinking, content))
+                            last_paint = time.monotonic()
 
-                    if obj.get("done"):
-                        # Raw counters; run_turn sums these across the turn and
-                        # formats one line at the end via fmt_stats.
-                        stats = {
-                            "prompt_eval_count":    obj.get("prompt_eval_count", 0),
-                            "prompt_eval_duration": obj.get("prompt_eval_duration", 0),
-                            "eval_count":           obj.get("eval_count", 0),
-                            "eval_duration":        obj.get("eval_duration", 0),
-                        }
-                        break
+                        # Tool calls appear in a dedicated field, often in a chunk
+                        # where content is empty.
+                        tcs = msg.get("tool_calls", [])
+                        if tcs:
+                            tool_calls.extend(tcs)
+
+                        if obj.get("done"):
+                            # Raw counters; run_turn sums these across the turn and
+                            # formats one line at the end via fmt_stats.
+                            stats = {
+                                "prompt_eval_count":    obj.get("prompt_eval_count", 0),
+                                "prompt_eval_duration": obj.get("prompt_eval_duration", 0),
+                                "eval_count":           obj.get("eval_count", 0),
+                                "eval_duration":        obj.get("eval_duration", 0),
+                            }
+                            break
+            except KeyboardInterrupt:
+                # Ctrl-C abandons the stream like Esc does, and the pump is
+                # blocked in recv just the same — without the shutdown Ollama
+                # keeps generating and the next request queues behind it.
+                _abort_stream(resp)
+                raise
     except socket.timeout:
         # Retry once, with retry_stall cleared so the retried request can't
         # keep retrying itself. Any partial content is discarded — a fresh

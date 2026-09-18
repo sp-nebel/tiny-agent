@@ -180,9 +180,11 @@ def read_interjection(live, seed="", repaint=None):
     restart and repaint immediately — Live only paints on its own throttle, so
     without `repaint` the region would sit blank until the next chunk lands.
 
-    No socket read is outstanding while the user types, and STREAM_TIMEOUT is
-    a per-read timeout, so a slow typist can't time the connection out; the
-    server keeps generating into the socket buffer meanwhile.
+    A slow typist can't time the connection out: STREAM_TIMEOUT is a
+    per-read timeout, and the reads happen on call_ollama's pump thread
+    (ollama._iter_with_ticks), which keeps draining the socket into its
+    queue while the user types — the server keeps sending, and every chunk
+    resets the timer. The stream picks up from the queue once the line is in.
     """
     # Live.stop() forces vertical_overflow to "visible" so its last frame
     # renders whole, and start() doesn't undo it — left alone, the restarted
@@ -206,8 +208,17 @@ def read_interjection(live, seed="", repaint=None):
     return text
 
 
-def _render_stream(thinking: str, content: str) -> Text:
+# How long nothing may stream before the live view explains the silence.
+QUIET_NOTICE_AFTER = 2
+
+
+def _render_stream(thinking: str, content: str, quiet_s: float = 0.0) -> Text:
     """Build the live view: reasoning above the answer-so-far, both dim.
+
+    quiet_s is how long nothing has streamed. Past QUIET_NOTICE_AFTER seconds
+    a notice is appended explaining the silence — a tool call arrives whole
+    once the model finishes composing it — and that the keys still work,
+    because that is the moment a user otherwise concludes the agent hung.
 
     Lives only in the transient Live region, so when the stream finishes the
     whole thing is wiped and run_turn re-renders the content as Markdown —
@@ -221,7 +232,11 @@ def _render_stream(thinking: str, content: str) -> Text:
     terminal height ourselves — answer in full, plus as many of the most recent
     thinking lines as fit above it — so the live tail is always what you see.
     """
-    avail = max(4, config.console.size.height - 2)
+    quiet = quiet_s >= QUIET_NOTICE_AFTER
+    # The notice sits at the bottom, which is exactly where Live crops an
+    # over-tall region — reserve its rows (blank separator + one line)
+    # rather than let it be the first thing cut.
+    avail = max(4, config.console.size.height - 2 - (2 if quiet else 0))
     out   = Text()
 
     content_lines = content.splitlines() if content else []
@@ -242,6 +257,12 @@ def _render_stream(thinking: str, content: str) -> Text:
 
     if content:
         out.append("\n".join(content_lines), style="dim")
+    if quiet:
+        if thinking or content:
+            out.append("\n\n")
+        out.append(f"generating… {quiet_s:.0f}s without visible output (a tool call "
+                   f"arrives whole once it is finished). Esc cancels, typing "
+                   f"queues a message.", style="dim italic")
     return out
 
 # --------------------------------------------------------------------------- #
