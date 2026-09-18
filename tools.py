@@ -741,6 +741,9 @@ def edit_file(path, old_string, new_string, replace_all=False):
         offset, matched, new_text, label = fuzzy
         new_content = content[:offset] + new_text + content[offset + len(matched):]
         n, note     = 1, f" (matched {label})"
+        if replace_all:
+            # A loose match is only trusted when unique, so "all" is one.
+            note = f" (matched {label}; replace_all needs an exact match, so only this one was replaced)"
     elif count > 1 and not replace_all:
         return (f"[old_string matches {count} times; add surrounding context to "
                 f"make it unique, or set replace_all=true]")

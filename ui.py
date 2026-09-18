@@ -460,7 +460,8 @@ def tool_outcome(name, result):
     """A few words on what came back, for the end of the call line."""
     first = result.split("\n", 1)[0]
     if name == "read_file":
-        m = re.match(r"\[lines (\d+-\d+ of \d+)", first)
+        # Not necessarily the first line: a latin-1 file's note comes first.
+        m = re.search(r"^\[lines (\d+-\d+ of \d+)", result, re.M)
         if m:
             return m.group(1)
         m = re.search(r"\[end of file, (\d+) lines?\]$", result)

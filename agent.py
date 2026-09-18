@@ -1019,8 +1019,9 @@ def main():
 
     def autosave():
         # Skip a system-prompt-only conversation so exits without real work
-        # don't litter the session store.
-        if len(messages) > 1:
+        # don't litter the session store — and a piped one-shot run, which
+        # a script may make hundreds of times.
+        if len(messages) > 1 and not piped:
             with contextlib.suppress(OSError):
                 save_session(session_name or default_ts_name(), messages, session_title)
     atexit.register(autosave)
