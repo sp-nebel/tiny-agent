@@ -62,6 +62,7 @@ python local_agent.py
 | `/sessions` | List saved sessions |
 | `!cmd` | Run a shell command yourself; its output (and exit code) is shown and goes to the model ahead of your next message. It runs in a subshell, so `!cd` has no lasting effect |
 | `!!cmd` | Same, but the output is only shown to you, never sent to the model |
+| Line ending in `\` | Continue the prompt on the next line (a dim `...` prompt); the lines are sent as one message. A multi-line paste needs no backslashes — it already arrives as one message |
 | `@path` in a prompt | Attach that file: its contents go to the model with the message, exactly as the model's own first `read_file` of it would return them (numbered lines, first 100, with the usual instruction for reading on). Only tokens that name an existing file count, so `me@example.com` and `@alice` stay plain text; trailing sentence punctuation is ignored. Paths with spaces aren't supported |
 | `/undo` | Take back the last turn: its messages are cut from the conversation, the files it changed are restored from a git snapshot taken when it started, and its prompt is put back in the input line to edit and resend. Repeat to walk further back. Outside a git repo only the conversation is rewound |
 | Any other key during a reply | Pauses the stream and opens an `interject` prompt for a message to the model; the key you typed becomes the first character of the line. Delivered at the next step boundary (after the current tool round-trip finishes), or as the next prompt if the turn ends first. Submit an empty line to think better of it |

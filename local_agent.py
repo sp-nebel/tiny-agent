@@ -41,7 +41,8 @@ bare refusal. `/undo` takes back the last turn: its messages leave the
 conversation and, in a git repo, the files it changed are restored from a
 snapshot taken when it started. At the prompt, `!cmd` runs a shell command
 and sends its output to the model with your next message; `!!cmd` only
-shows it to you. `@path` in a prompt attaches that file's contents.
+shows it to you. `@path` in a prompt attaches that file's contents, and a
+line ending in `\\` continues onto the next.
 
 Env vars:
     AGENT_MODEL           (default: gemma4:12b-it-qat)   — any Ollama model with tool support

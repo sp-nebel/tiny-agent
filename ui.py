@@ -153,6 +153,25 @@ def read_prompt(prompt: str, seed: str = "") -> str:
             sys.stdout.write(BRACKETED_PASTE_OFF); sys.stdout.flush()
 
 
+def read_multiline(prompt: str, seed: str = "") -> str:
+    """read_prompt, continued onto further lines while a line ends in `\\`,
+    the shell's convention — readline has no key for a literal newline, and a
+    paste already arrives as one message, so this is only for typing. The
+    backslash is dropped and the lines are joined with newlines.
+
+    Only the main prompt uses it: an interjection or steering note is one
+    line typed into a live stream, where a dangling continuation prompt would
+    hold the reply paused.
+    """
+    lines = []
+    line  = read_prompt(prompt, seed)
+    while line.rstrip().endswith("\\"):
+        lines.append(line.rstrip()[:-1])
+        line = read_prompt("[dim]...[/dim] ")
+    lines.append(line)
+    return "\n".join(lines)
+
+
 # Messages typed while a reply was streaming, waiting to be handed to the
 # model. Module-level rather than passed around because stdin already is:
 # call_ollama re-enters itself on three retry paths (think fallback, refused

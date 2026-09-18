@@ -14,7 +14,7 @@ import config
 import checkpoint
 from tools import dispatch, read_file, _run_shell
 from ollama import call_ollama, warm_cache
-from ui import (read_prompt, fmt_args, truncate, fmt_stats,
+from ui import (read_prompt, read_multiline, fmt_args, truncate, fmt_stats,
                 take_interjections, interjections_pending)
 from session import *
 
@@ -818,8 +818,9 @@ def main():
         "streams, just start typing to queue a message for the model; Tab "
         "stops the reply now so you can steer it; Esc cancels the reply. "
         "'!cmd' runs a shell command and sends its output with your next "
-        "message ('!!cmd': shown only to you), '@path' attaches a file, '/undo' to take back the last turn (files too, in a git repo), "
-        "'/clear' to reset context, '/save', '/resume', "
+        "message ('!!cmd': shown only to you), '@path' attaches a file, a "
+        "trailing '\\' continues the line. '/undo' takes back the last turn "
+        "(files too, in a git repo), '/clear' to reset context, '/save', '/resume', "
         "'/sessions' to pause/switch conversations (each takes an optional "
         "name), 'exit' to quit.[/dim]\n"
     )
@@ -831,7 +832,7 @@ def main():
             config.console.print(f"[bold green]you[/bold green] {escape(user)}")
         else:
             try:
-                user = read_prompt("[bold green]you[/bold green] ", seed).strip()
+                user = read_multiline("[bold green]you[/bold green] ", seed).strip()
                 seed = ""
             except (EOFError, KeyboardInterrupt):
                 config.console.print("\nbye")

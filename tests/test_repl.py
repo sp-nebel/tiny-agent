@@ -1,5 +1,5 @@
 """main()'s REPL over scripted prompt input, with run_turn and the warmup
-stubbed out — the prompt-level features (`!cmd`, `!!cmd`, `@file`, `/undo`) are
+stubbed out — the prompt-level features (`!cmd`, `!!cmd`, `@file`, `/undo`, `\` continuation) are
 pure bookkeeping on the message list and need no model."""
 import subprocess
 
@@ -7,6 +7,7 @@ import pytest
 
 import agent
 import config
+import ui
 from agent import SHELL_BLOCK_HEAD, run_shell_escape
 
 
@@ -34,7 +35,9 @@ class Repl:
                 self.on_turn(len(self.turns))
             self.messages = messages
 
-        monkeypatch.setattr(agent, "read_prompt", fake_read_prompt)
+        # Patched in ui, where read_multiline looks it up, so the main
+        # prompt's `\` continuation runs for real over the scripted lines.
+        monkeypatch.setattr(ui, "read_prompt", fake_read_prompt)
         monkeypatch.setattr(agent, "run_turn", fake_run_turn)
         monkeypatch.setattr(agent, "warm_cache", lambda *a, **k: None)
         # Keep main()'s exit hooks (session autosave, readline history) out of
@@ -112,3 +115,10 @@ def test_file_ref_is_attached_but_prompt_seed_stays_raw(monkeypatch, tmp_path):
     r = Repl(monkeypatch, ["fix @a.py", "/undo"]).run()
     assert "[contents of a.py, attached by the user]" in r.turns[0]
     assert r.seeds[2] == "fix @a.py"
+
+
+def test_backslash_continues_the_prompt(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    r = Repl(monkeypatch, ["first line \\", "  second\\", "third", "next"]).run()
+    assert r.turns[0].endswith("first line \n  second\nthird")
+    assert r.turns[1] == "next"
