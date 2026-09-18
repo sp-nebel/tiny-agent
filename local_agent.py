@@ -51,6 +51,7 @@ Env vars:
     OLLAMA_URL            (default: http://localhost:11434)
     AGENT_THINK           (default: 1) — set to 0 to disable reasoning output
     AGENT_NUM_CTX         (default: 24576) — Ollama context window size; lower on memory-constrained machines
+    AGENT_SYNTAX_CHECKS   (default: none) — JSON {".ext": "command {path}"} syntax checks run after an edit
     AGENT_STREAM_TIMEOUT  (default: 300) — per-read socket timeout (s) on streaming calls; the call right
                           after a trim pass instead gets a timeout sized to its full re-prefill
 

@@ -1,4 +1,5 @@
 import os
+import json
 
 from rich.console import Console
 
@@ -16,6 +17,8 @@ MAX_GREP_HITS  = 20
 GREP_MAX_LINE_CHARS = 300
 MAX_GLOB_HITS  = 20
 MAX_LIST_HITS  = 200
+# Files looked at for a "did you mean" when a path doesn't exist.
+SIMILAR_PATHS_SCAN = 5000
 MAX_CMD_CHARS  = 8000
 CMD_TIMEOUT    = 120
 # Ceiling on run_cmd's per-call timeout parameter — under --yes the model's
@@ -100,6 +103,17 @@ KEEP_RECENT_MESSAGES    = 6
 # so "a stub is short → never re-collapsed" wouldn't recognise it and every
 # later pass would re-edit it, destroying the original "was N chars" figure.
 TRIM_PREFIX        = "[«compacted» "
+
+# Syntax check after edit_file/append_file writes a file, reported as one
+# line in the tool result — a light stand-in for an LSP. .py (ast) and
+# .json are built in; more extensions via a JSON object of shell commands
+# with {path} as the placeholder, e.g.
+#   AGENT_SYNTAX_CHECKS='{".js": "node --check {path}", ".sh": "bash -n {path}"}'
+try:
+    SYNTAX_CHECK_CMDS = json.loads(os.environ.get("AGENT_SYNTAX_CHECKS", "{}"))
+except ValueError:
+    SYNTAX_CHECK_CMDS = {}
+SYNTAX_CHECK_TIMEOUT = 20
 
 # Directories never worth walking in a glob.
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv",

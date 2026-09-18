@@ -32,11 +32,12 @@ def test_genuine_numeric_column_content_not_mistaken_for_line_numbers(tmp_path, 
     content = "Report Q2\n42  widgets sold\n99  gadgets sold\n"
     _write(p, content)
 
-    # old_string has an unrelated leading-space typo, so it fails to match
-    # the file for a reason that has nothing to do with a line-number column.
-    # The heuristic must not mistake the file's genuine "42  " column for
-    # read_file's metadata and tell the model to strip real data.
-    result = edit_file(p, " 42  widgets sold\n", " 42  widgets bought\n")
+    # old_string has an unrelated typo, so it fails to match the file for a
+    # reason that has nothing to do with a line-number column. The heuristic
+    # must not mistake the file's genuine "42  " column for read_file's
+    # metadata and tell the model to strip real data. (The typo is inside the
+    # line: a leading-space one is now forgiven by the indentation fallback.)
+    result = edit_file(p, "42  widget sold\n", "42  widgets bought\n")
     assert "line-number" not in result
     assert result == "[old_string not found; it must match the file exactly, whitespace included]"
     # The file must be untouched.

@@ -1,6 +1,11 @@
+import io
 import os
 import re
+import ast
+import json
 import glob
+import shlex
+import warnings
 import shutil
 import signal
 import difflib
@@ -136,16 +141,71 @@ def _cap_output(text, max_chars=None):
     return (text[:head] + f"\n[… {len(text) - max_chars} chars elided …]\n" + text[-tail:])
 
 
-def read_file(path, start=1, end=None):
+def _similar_paths(path, limit=3):
+    """Existing files whose name is close to `path`'s, for a "did you mean".
+
+    A small model that guesses a path wrong (src/util.py for lib/utils.py)
+    otherwise spends a step or two on find_files before trying again. The
+    walk is bounded so a huge tree can't stall the error message.
+    """
+    want = os.path.basename(path.rstrip("/"))
+    if not want:
+        return []
+    by_name = {}
+    seen    = 0
+    for root, dirs, files in os.walk("."):
+        dirs[:] = [d for d in dirs if d not in config.SKIP_DIRS and not d.startswith(".")]
+        for f in files:
+            by_name.setdefault(f, []).append(os.path.normpath(os.path.join(root, f)))
+            seen += 1
+        if seen > config.SIMILAR_PATHS_SCAN:
+            break
+    out = []
+    for name in difflib.get_close_matches(want, list(by_name), n=limit, cutoff=0.6):
+        out.extend(sorted(by_name[name]))
+    return out[:limit]
+
+
+def _missing(path, advice=""):
+    """"[no such file]" plus the nearest real paths, then `advice`."""
+    msg   = f"[no such file: {path}."
+    close = _similar_paths(path)
+    if close:
+        msg += f" Did you mean: {', '.join(close)}?"
+    return msg + (f" {advice}" if advice else "") + "]"
+
+
+def _decode(data):
+    """Bytes → (text, is_utf8). Anything that isn't UTF-8 decodes as
+    latin-1, which never fails: a NUL byte is the binary test, not a decode
+    error, so latin-1 source files are shown instead of refused."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        return f"[no such file: {path}]"
+        return data.decode("utf-8"), True
     except UnicodeDecodeError:
-        return f"[binary file, cannot display: {path}]"
+        return data.decode("latin-1"), False
+
+
+def read_file(path, start=1, end=None):
+    if os.path.isdir(path):
+        # A directory is a common wrong guess; answering with its listing
+        # saves the step the model would otherwise spend on list_dir.
+        return f"[{path} is a directory, not a file. Its entries:]\n" + list_dir(path)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return _missing(path)
     except OSError as e:
         return f"[error reading {path}: {e}]"
+    if b"\0" in data[:4096]:
+        return f"[binary file, cannot display: {path}]"
+    text, utf8 = _decode(data)
+    enc_note = "" if utf8 else (f"[{path} is not UTF-8; shown decoded as latin-1. "
+                                f"edit_file and append_file cannot change it]\n")
+    # Universal newlines, as text-mode open() gave before: \r\n and a lone
+    # \r both end a line, and nothing else does (str.splitlines would also
+    # split on form feeds and \u2028, shifting every line number after one).
+    lines = io.StringIO(text.replace("\r\n", "\n").replace("\r", "\n")).readlines()
 
     total = len(lines)
     start = max(1, int(start))
@@ -194,7 +254,10 @@ def read_file(path, start=1, end=None):
             + body
             + f"[TRUNCATED. To continue reading, call read_file with start={end+1}.]"
         )
-    return body or "[empty file]"
+    elif body:
+        # Said outright, so the model stops re-reading past the end to check.
+        body += f"[end of file, {total} line{'s' if total != 1 else ''}]"
+    return (enc_note + body) if body else "[empty file]"
 
 
 def _grep_records(raw):
@@ -350,6 +413,138 @@ def cd(path):
     return f"[cwd: {os.getcwd()}]"
 
 
+# Typographic characters a model tends to "correct" when it copies code:
+# mapped to ASCII on both sides for the last fuzzy pass only.
+_ASCII_MAP = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
+    "\u2014": "-", "\u2212": "-", "\u00a0": " ",
+})
+
+# Tried in order, only after an exact match failed; each compares whole
+# lines. Deliberately no edit-distance matching (OpenCode's Levenshtein and
+# block-anchor matchers): under --yes a loose match edits the wrong code
+# with nobody looking.
+_FUZZY_PASSES = [
+    ("ignoring trailing whitespace",               lambda l: l.rstrip()),
+    ("ignoring indentation",                       lambda l: l.strip()),
+    ("ignoring indentation and quote/dash style",  lambda l: l.translate(_ASCII_MAP).strip()),
+]
+
+
+def _leading_ws(line):
+    return line[:len(line) - len(line.lstrip(" \t"))]
+
+
+def _fuzzy_match(content, old, new):
+    """Find `old` in `content` by whole lines, more loosely than exactly.
+
+    Returns (offset, matched_text, new_text, label) for a unique match,
+    ("ambiguous", label, count) when a pass matches more than once, or None.
+    `content` is the raw file (lines may end in \r); `old`/`new` are LF.
+
+    The matched region is the file's own text, and the replacement is
+    spliced in at its offset rather than via str.replace, which could hit an
+    earlier substring ("  foo()" inside "    foo()"). When the indentation
+    differed, new_string is shifted by the same amount, so a model that
+    dropped a level of indent from both strings still writes correctly
+    indented code.
+    """
+    old_lines = old.split("\n")
+    trailing  = old.endswith("\n")
+    if trailing:
+        old_lines = old_lines[:-1]
+    if not any(l.strip() for l in old_lines):
+        return None
+    file_lines = content.split("\n")
+    n = len(old_lines)
+    for label, norm in _FUZZY_PASSES:
+        target = [norm(l) for l in old_lines]
+        hits = [i for i in range(len(file_lines) - n + 1)
+                if norm(file_lines[i]) == target[0]
+                and all(norm(file_lines[i + k]) == target[k] for k in range(1, n))]
+        if not hits:
+            continue
+        if len(hits) > 1:
+            return ("ambiguous", label, len(hits))
+        i       = hits[0]
+        offset  = sum(len(l) + 1 for l in file_lines[:i])
+        matched = "\n".join(file_lines[i:i + n])
+        if trailing and i + n < len(file_lines):
+            matched += "\n"
+        elif matched.endswith("\r"):
+            matched = matched[:-1]     # the line ending isn't part of old_string
+        # Same line count by construction, so this only trips on whitespace
+        # runs far longer than the model wrote — not the region it meant.
+        if len(matched) > 2 * len(old) + 200:
+            return None
+        k        = next(j for j, l in enumerate(old_lines) if l.strip())
+        old_ind  = _leading_ws(old_lines[k])
+        file_ind = _leading_ws(file_lines[i + k])
+        if old_ind != file_ind:
+            new = "\n".join(file_ind + l[len(old_ind):] if l.strip() and l.startswith(old_ind) else l
+                            for l in new.split("\n"))
+        if "\r\n" in matched or file_lines[i].endswith("\r"):
+            new = new.replace("\n", "\r\n")
+        return offset, matched, new, label
+    return None
+
+
+def _syntax_error(path, text):
+    """First syntax error in `text` as one line, or None. Built in for .py
+    and .json; other extensions via config.SYNTAX_CHECK_CMDS, run on the
+    file as written (so `text` is unused there)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".py":
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")    # invalid-escape noise on stderr
+                ast.parse(text, filename=path)
+        except SyntaxError as e:
+            return f"line {e.lineno}: {e.msg}"
+        except ValueError as e:                    # NUL bytes
+            return str(e)
+        return None
+    if ext == ".json":
+        try:
+            json.loads(text)
+        except ValueError as e:
+            return f"line {getattr(e, 'lineno', '?')}: {getattr(e, 'msg', e)}"
+        return None
+    cmd = config.SYNTAX_CHECK_CMDS.get(ext)
+    if not cmd:
+        return None
+    try:
+        out = subprocess.run(cmd.replace("{path}", shlex.quote(path)), shell=True,
+                             capture_output=True, text=True, errors="replace",
+                             timeout=config.SYNTAX_CHECK_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode == 0:
+        return None
+    first = next((l.strip() for l in (out.stdout + out.stderr).splitlines() if l.strip()), "")
+    return first[:300] or f"exit {out.returncode}"
+
+
+def _syntax_note(path, before, after):
+    """Tool-result suffix when this write broke the file's syntax.
+
+    Only for errors the write *introduced*: a file that already failed to
+    parse (a JSON file with comments, say, or one the model is midway
+    through fixing) would otherwise get the warning on every edit. The
+    custom-command check can't see the before state and always reports.
+    """
+    err = _syntax_error(path, after)
+    if not err:
+        return ""
+    ext = os.path.splitext(path)[1].lower()
+    if before is not None and ext in (".py", ".json") and _syntax_error(path, before):
+        return ""
+    return (f"\n[warning: {path} now has a syntax error, {err}. "
+            f"Fix it before moving on.]")
+
+
 def edit_file(path, old_string, new_string, replace_all=False):
     # Empty old_string ⇒ create a new file (the write_file behaviour, folded in).
     if old_string == "":
@@ -380,18 +575,26 @@ def edit_file(path, old_string, new_string, replace_all=False):
                 f.write(new_string)
         except OSError as e:
             return f"[error writing {path}: {e}]"
-        return f"[created {path}, {len(new_string)} chars]"
+        return (f"[created {path}, {len(new_string)} chars]"
+                + _syntax_note(path, None, new_string))
 
     # Read and write the raw bytes (newline=""): a default-mode round trip
     # translates every CRLF to LF, so a one-line edit silently rewrote the
     # line endings of a whole Windows-style file.
+    if old_string == new_string:
+        return ("[old_string and new_string are identical, so this edit would "
+                "change nothing. Put the changed text in new_string]")
+    # Strict UTF-8, unlike read_file: a lossy decode would rewrite bytes the
+    # model never saw when the file is written back.
     try:
         with open(path, "r", encoding="utf-8", newline="") as f:
             content = f.read()
     except FileNotFoundError:
-        return f"[no such file: {path}; pass an empty old_string to create it]"
+        return _missing(path, "To create it, pass an empty old_string.")
+    except IsADirectoryError:
+        return f"[{path} is a directory, not a file]"
     except UnicodeDecodeError:
-        return f"[binary file, cannot edit: {path}]"
+        return f"[{path} is binary or not UTF-8 text, so edit_file cannot change it]"
     except OSError as e:
         return f"[error reading {path}: {e}]"
 
@@ -410,24 +613,36 @@ def edit_file(path, old_string, new_string, replace_all=False):
             old_string, new_string = old_crlf, new_lf.replace("\n", "\r\n")
 
     count = content.count(old_string)
+    note  = ""
     if count == 0:
         # Common small-model failure: copying read_file's "   12  " line-number
         # column into old_string. Detect it and say so directly instead of the
         # generic mismatch message, since "match exactly" alone tends to make
-        # the model retry the same mistake with more surrounding lines.
+        # the model retry the same mistake with more surrounding lines. Checked
+        # before the fuzzy pass on purpose: this mistake is taught, not
+        # silently forgiven, or the model keeps making it.
         stripped = _strip_line_number_prefix(old_lf)
         if stripped is not None and content.replace("\r\n", "\n").count(stripped) > 0:
             return ("[old_string not found - it still has read_file's line-number "
                     "prefix (e.g. '   12  '); that's display metadata, not file "
                     "content. Strip it from the start of each line and try again]")
-        return "[old_string not found; it must match the file exactly, whitespace included]"
-    if count > 1 and not replace_all:
+        fuzzy = _fuzzy_match(content, old_lf, new_lf)
+        if fuzzy is None:
+            return "[old_string not found; it must match the file exactly, whitespace included]"
+        if fuzzy[0] == "ambiguous":
+            return (f"[old_string not found exactly; {fuzzy[1]} it matches "
+                    f"{fuzzy[2]} places. Copy the exact text from read_file and "
+                    f"add surrounding lines to make it unique]")
+        offset, matched, new_text, label = fuzzy
+        new_content = content[:offset] + new_text + content[offset + len(matched):]
+        n, note     = 1, f" (matched {label})"
+    elif count > 1 and not replace_all:
         return (f"[old_string matches {count} times; add surrounding context to "
                 f"make it unique, or set replace_all=true]")
-
-    n           = count if replace_all else 1
-    new_content = content.replace(old_string, new_string, -1 if replace_all else 1)
-    plural      = "s" if n != 1 else ""
+    else:
+        n           = count if replace_all else 1
+        new_content = content.replace(old_string, new_string, -1 if replace_all else 1)
+    plural = "s" if n != 1 else ""
     # Diffed as LF: difflib would otherwise show a stray \r on every line.
     show_diff(content.replace("\r\n", "\n"), new_content.replace("\r\n", "\n"), path)
     ok, reason = confirm(f"edit {path} ({n} replacement{plural})?")
@@ -438,7 +653,8 @@ def edit_file(path, old_string, new_string, replace_all=False):
             f.write(new_content)
     except OSError as e:
         return f"[error writing {path}: {e}]"
-    return f"[edited {path}: {n} replacement{plural}]"
+    return (f"[edited {path}: {n} replacement{plural}{note}]"
+            + _syntax_note(path, content, new_content))
 
 
 def append_file(path, text):
@@ -462,6 +678,8 @@ def append_file(path, text):
             raw = f.read()
     except FileNotFoundError:
         raw = None
+    except IsADirectoryError:
+        return f"[{path} is a directory, not a file]"
     except UnicodeDecodeError:
         return f"[binary file, cannot append: {path}]"
     except OSError as e:
@@ -487,12 +705,13 @@ def append_file(path, text):
             f.write(new_content)
     except OSError as e:
         return f"[error writing {path}: {e}]"
+    check = _syntax_note(path, existing if raw is not None else None, new_content)
     if raw is None:
-        return f"[created {path}, {len(text)} chars]"
+        return f"[created {path}, {len(text)} chars]" + check
     # The line count lets the model aim a follow-up read_file at the new
     # tail without first reading the whole file to find it.
     return (f"[appended {len(text)} chars to {path}; it now has "
-            f"{len(new_content.splitlines())} lines]")
+            f"{len(new_content.splitlines())} lines]" + check)
 
 
 class CommandInterrupted(KeyboardInterrupt):
