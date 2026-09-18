@@ -414,21 +414,30 @@ def append_file(path, text):
             f"{len(new_content.splitlines())} lines]")
 
 
-def run_cmd(cmd):
-    ok, reason = confirm(f"run: {cmd}")
-    if not ok:
-        return declined("command", reason)
+def _run_shell(cmd):
+    """Run `cmd` in a shell: (capped combined output, exit code), or (None,
+    None) on timeout. Shared by run_cmd and the user's `!cmd` prompt escape,
+    so both see the same cap and timeout."""
     try:
         out = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=config.CMD_TIMEOUT
         )
     except subprocess.TimeoutExpired:
-        return f"[timed out after {config.CMD_TIMEOUT}s]"
+        return None, None
     combined = (out.stdout + out.stderr).strip()
     # Keep head AND tail: test runners and builds put the failure summary at
     # the end, and losing it makes the model re-run the command.
-    combined = _cap_output(combined, config.MAX_CMD_CHARS)
-    return combined or f"[exit {out.returncode}, no output]"
+    return _cap_output(combined, config.MAX_CMD_CHARS), out.returncode
+
+
+def run_cmd(cmd):
+    ok, reason = confirm(f"run: {cmd}")
+    if not ok:
+        return declined("command", reason)
+    combined, code = _run_shell(cmd)
+    if code is None:
+        return f"[timed out after {config.CMD_TIMEOUT}s]"
+    return combined or f"[exit {code}, no output]"
 
 
 TOOLS = {

@@ -122,6 +122,8 @@ Run `python3 local_agent.py` and exercise:
   unescaped).
 - Ctrl-C while a tool is running — the turn aborts but history stays well-formed
   (stub `[interrupted before this tool ran]` results pair up any pending tool_calls).
+- `!git status` then a question about it — the model answers from the output; `!!ls` shows
+  output but the model never sees it.
 - `/undo` after a turn that edited a file in a git repo — the file is back, a file the turn
   created is gone, the prompt is pre-filled in the input line, and `git status` / `git diff
   --cached` look exactly as before the turn. Outside a repo it warns and rewinds only the

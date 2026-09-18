@@ -33,7 +33,8 @@ read `verifying-tiny-agent`.
   prefill-sized stall timeout and one retry), `_stub_tool_outputs` (shared stub helper),
   `drop_thinking` and `strip_nudges` (turn-boundary cleanup, invoked from `run_turn`'s
   `finally`, which also stubs the finished turn's oversized tool outputs), `main()` (CLI +
-  REPL with `/clear`, `/save`, `/resume`, `/sessions`, `/undo`; `undo_last_turn` pops a
+  REPL with `/clear`, `/save`, `/resume`, `/sessions`, `/undo`, `!cmd`/`!!cmd` (output held in `pending_shell` and prepended to the
+  next prompt's user message); `undo_last_turn` pops a
   per-turn record and cuts history back to where that turn began).
 - `ollama.py` — HTTP layer. `_build_payload` is the **single source of truth for request
   bodies**; both call sites (`call_ollama`, `warm_cache`) go through it so

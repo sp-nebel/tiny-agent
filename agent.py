@@ -11,7 +11,7 @@ from rich.markup import escape
 
 import config
 import checkpoint
-from tools import dispatch
+from tools import dispatch, _run_shell
 from ollama import call_ollama, warm_cache
 from ui import (read_prompt, fmt_args, truncate, fmt_stats,
                 take_interjections, interjections_pending)
@@ -613,6 +613,36 @@ def run_turn(messages, max_steps=20, check_every=20):
                           f"{'s' if stubbed != 1 else ''} from this turn[/dim]")
 
 # --------------------------------------------------------------------------- #
+# Prompt expansions
+# --------------------------------------------------------------------------- #
+
+# Leads the output of a `!cmd` the user ran at the prompt, when it rides along
+# with their next message. Bracketed, like every other piece of metadata the
+# model is shown, and it says who ran the command — otherwise a small model
+# reads a pasted-looking command output as something it did itself.
+SHELL_BLOCK_HEAD = "[the user ran this shell command: {cmd} — {status}]"
+
+
+def run_shell_escape(cmd):
+    """Run a `!cmd` / `!!cmd` typed at the prompt, show its output, and
+    return it as a block for the model. No confirmation: the user typed it.
+
+    Runs through the same _run_shell as the model's run_cmd, so the output
+    the model gets is capped the same way. A subshell, so `!cd` changes
+    nothing that outlives it.
+    """
+    output, code = _run_shell(cmd)
+    if code is None:
+        status = f"timed out after {config.CMD_TIMEOUT}s"
+        output = ""
+    else:
+        status = f"exit {code}"
+    if output:
+        config.console.print(f"[dim]{escape(output)}[/dim]")
+    config.console.print(f"[dim]{escape(status)}[/dim]")
+    return SHELL_BLOCK_HEAD.format(cmd=cmd, status=status) + "\n" + (output or "[no output]")
+
+# --------------------------------------------------------------------------- #
 # Undo
 # --------------------------------------------------------------------------- #
 
@@ -702,6 +732,11 @@ def main():
     # Text pre-filled into the next prompt line — the prompt of an undone
     # turn, so it can be edited and resent.
     seed           = ""
+    # Output of `!cmd`s run since the last turn, sent ahead of the next
+    # prompt as part of the same user message — so it costs nothing until
+    # there is a question about it, and never leaves two user messages in a
+    # row.
+    pending_shell  = []
 
     def autosave():
         # Skip a system-prompt-only conversation so exits without real work
@@ -746,7 +781,8 @@ def main():
         "hasn't finished. later turns reuse the KV cache. while a reply "
         "streams, just start typing to queue a message for the model; Tab "
         "stops the reply now so you can steer it; Esc cancels the reply. "
-        "'/undo' to take back the last turn (files too, in a git repo), "
+        "'!cmd' runs a shell command and sends its output with your next "
+        "message ('!!cmd': shown only to you), '/undo' to take back the last turn (files too, in a git repo), "
         "'/clear' to reset context, '/save', '/resume', "
         "'/sessions' to pause/switch conversations (each takes an optional "
         "name), 'exit' to quit.[/dim]\n"
@@ -767,6 +803,16 @@ def main():
 
         if user.lower() in ("exit", "quit"):
             return
+        if user.startswith("!"):
+            local = user.startswith("!!")
+            cmd   = user[2 if local else 1:].strip()
+            if cmd:
+                block = run_shell_escape(cmd)
+                if not local:
+                    pending_shell.append(block)
+                    config.console.print("[dim]output goes to the model with your next message[/dim]")
+            config.console.print()
+            continue
         if user.lower() in ("/clear", "clear"):
             # Drop all conversation history but keep messages[0] (the static
             # system prompt). The system prompt + tool schemas are the cached
@@ -775,6 +821,7 @@ def main():
             # context into the next first user message.
             del messages[1:]
             del turns[:]
+            del pending_shell[:]
             first_user_msg = True
             config.console.print("[dim]context cleared (system prompt preserved)[/dim]\n")
             continue
@@ -824,6 +871,7 @@ def main():
             session_name   = new_name
             first_user_msg = False
             del turns[:]
+            del pending_shell[:]
             config.console.print(f"[dim]resumed session '{escape(new_name)}' ({len(messages)} messages)[/dim]\n")
             threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
             continue
@@ -848,7 +896,9 @@ def main():
         # session. Computed here, not once at startup, so a `cd` tool call or
         # a `/clear` (which resets first_user_msg) picks up the current
         # directory instead of whatever it was when the process started.
-        content       = (f"Working directory: {os.getcwd()}\n\n" + user) if first_user_msg else user
+        content        = "\n\n".join(pending_shell + [user])
+        content        = (f"Working directory: {os.getcwd()}\n\n" + content) if first_user_msg else content
+        del pending_shell[:]
         first_user_msg = False
         messages.append({"role": "user", "content": content})
 
