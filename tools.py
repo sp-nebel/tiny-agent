@@ -24,30 +24,98 @@ from ui import notify
 # Tools (implementations)
 # --------------------------------------------------------------------------- #
 
-def confirm(msg: str):
+# Session-long approvals from answering `a`: "edit" for every file edit, or
+# "cmd:<prefix>" for commands starting with that prefix. Process-lifetime
+# only, never saved — an approval is given to this session, not the repo.
+_always_allowed = set()
+
+# How many words name a command, for the `a` answer: `git checkout main`
+# approves `git checkout *`, not all of git. Longest listed prefix wins;
+# anything unlisted is one word. (After OpenCode's permission/arity.ts.)
+COMMAND_ARITY = {
+    "git": 2, "npm": 2, "npm run": 3, "pnpm": 2, "pnpm run": 3, "yarn": 2,
+    "yarn run": 3, "npx": 2, "bun": 2, "bun run": 3, "cargo": 2, "go": 2,
+    "docker": 2, "docker compose": 3, "kubectl": 2, "pip": 2, "pip3": 2,
+    "python -m": 3, "python3 -m": 3, "uv": 2, "uv run": 3, "poetry": 2,
+    "poetry run": 3, "make": 2, "bundle": 2, "bundle exec": 3, "dotnet": 2,
+    "gradle": 2, "mvn": 2, "systemctl": 2, "brew": 2, "apt": 2, "dnf": 2,
+}
+
+# Anything that can chain, substitute or redirect: with one of these in the
+# command, a prefix says nothing about what runs ("git status; rm -rf x"
+# starts with "git status"), so `a` is not offered and no approval matches.
+_SHELL_META = re.compile(r"[;&|<>`$\n(){}]")
+
+
+def command_prefix(cmd):
+    """The approval prefix for `cmd` ("git checkout"), or None when the
+    command can't be approved by prefix."""
+    if _SHELL_META.search(cmd):
+        return None
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return None
+    if not words or "=" in words[0]:
+        return None                 # FOO=1 cmd: the variable could be anything
+    arity = 1
+    for k in (3, 2, 1):
+        if " ".join(words[:k]) in COMMAND_ARITY:
+            arity = COMMAND_ARITY[" ".join(words[:k])]
+            break
+    return " ".join(words[:arity])
+
+
+def command_allow(cmd):
+    """confirm()'s `allow` for a shell command, or None."""
+    prefix = command_prefix(cmd)
+    if prefix is None:
+        return None
+    return ("cmd:" + prefix, f"commands starting with '{prefix}'")
+
+
+EDIT_ALLOW = ("edit", "all file edits")
+
+
+def confirm(msg: str, allow=None):
     """Ask before a destructive action. Returns (approved, reason).
 
     Anything that isn't a yes or a bare no is taken as a denial *with a
     reason*, which the caller hands back to the model: "use the test runner,
     not python directly" turns a dead end into a redirect, where a plain
     refusal just invites the same call again.
+
+    `allow` is (key, description) when the action can be approved for the
+    rest of the session: `a` answers yes and remembers the key, and later
+    actions with that key pass without asking.
     """
     if config.AUTO_YES:
         return True, ""
+    if allow and allow[0] in _always_allowed:
+        config.console.print(f"[dim]auto-approved ({escape(allow[1])} are allowed "
+                             f"this session)[/dim]")
+        return True, ""
     notify("waiting for your confirmation")
+    hint = "[y/N/a/reason] " if allow else "[y/N/reason] "
+    extra = f"[dim](a = always allow {escape(allow[1])})[/dim] " if allow else ""
     try:
         # Both the message (a path or a shell command can contain brackets)
         # and the literal hint must be escaped: Rich reads a bracketed run
         # starting with a lowercase letter as a markup tag and drops an
         # unknown one silently — "[y/N/reason]" was never displayed.
         ans = config.console.input(
-            f"[yellow]{escape(msg)}[/yellow] " + escape("[y/N/reason] ")).strip()
+            f"[yellow]{escape(msg)}[/yellow] " + extra + escape(hint)).strip()
     except (EOFError, KeyboardInterrupt):
         return False, ""
     if ans.lower() in ("y", "yes"):
         return True, ""
     if ans.lower() in ("", "n", "no"):
         return False, ""
+    if allow and ans.lower() in ("a", "always"):
+        _always_allowed.add(allow[0])
+        config.console.print(f"[dim]{escape(allow[1])} are allowed for the rest "
+                             f"of this session[/dim]")
+        return True, ""
     return False, ans
 
 
@@ -593,7 +661,7 @@ def edit_file(path, old_string, new_string, replace_all=False):
                     f"to replace in old_string; an empty old_string only creates a "
                     f"new file or fills an empty one]")
         show_diff("", new_string, path)
-        ok, reason = confirm(f"create {path} ({len(new_string)} chars)?")
+        ok, reason = confirm(f"create {path} ({len(new_string)} chars)?", EDIT_ALLOW)
         if not ok:
             return declined("write", reason)
         try:
@@ -674,7 +742,7 @@ def edit_file(path, old_string, new_string, replace_all=False):
     plural = "s" if n != 1 else ""
     # Diffed as LF: difflib would otherwise show a stray \r on every line.
     show_diff(content.replace("\r\n", "\n"), new_content.replace("\r\n", "\n"), path)
-    ok, reason = confirm(f"edit {path} ({n} replacement{plural})?")
+    ok, reason = confirm(f"edit {path} ({n} replacement{plural})?", EDIT_ALLOW)
     if not ok:
         return declined("write", reason)
     try:
@@ -721,9 +789,9 @@ def append_file(path, text):
 
     show_diff(existing, new_content, path)
     if raw is None:
-        ok, reason = confirm(f"create {path} ({len(text)} chars)?")
+        ok, reason = confirm(f"create {path} ({len(text)} chars)?", EDIT_ALLOW)
     else:
-        ok, reason = confirm(f"append {len(text)} chars to {path}?")
+        ok, reason = confirm(f"append {len(text)} chars to {path}?", EDIT_ALLOW)
     if not ok:
         return declined("write", reason)
     try:
@@ -820,7 +888,7 @@ def run_shell(cmd, timeout=None):
 
 
 def run_cmd(cmd, timeout=None):
-    ok, reason = confirm(f"run: {cmd}")
+    ok, reason = confirm(f"run: {cmd}", command_allow(cmd))
     if not ok:
         return declined("command", reason)
     # Clamped: under --yes the model's number is the only limit there is.

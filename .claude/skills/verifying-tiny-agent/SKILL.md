@@ -117,7 +117,9 @@ Run `python3 local_agent.py` and exercise:
   the current step's tool results. Tab during a reply stops it at once and opens `steer`; the
   pending tool call must NOT run, and the model's next step follows the note. Tab inside the
   `interject` prompt is readline completion, not a stop.
-- The `[y/N/reason]` hint is visible on a confirmation prompt, and bracketed tool results
+- The `[y/N/a/reason]` hint is visible on a confirmation prompt (`[y/N/reason]` for a
+  chained command, which can't be always-allowed); `a` stops later prompts for the same
+  command prefix or for all edits, and bracketed tool results
   (`[lines 1-100 of 543 …]`) appear under their `→ tool …` line with `/details` on, or
   when the call failed (Rich would swallow them unescaped).
 - `/details` and `/thinking` toggle the display only; a turn that runs 20s+ ends with a
