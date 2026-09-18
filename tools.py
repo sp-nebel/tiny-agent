@@ -5,6 +5,8 @@ import ast
 import json
 import glob
 import shlex
+import inspect
+import tempfile
 import warnings
 import shutil
 import signal
@@ -136,9 +138,30 @@ def _cap_output(text, max_chars=None):
     max_chars = max_chars or config.MAX_TOOL_OUTPUT_CHARS
     if len(text) <= max_chars:
         return text
-    head = max_chars // 4
-    tail = max_chars - head
-    return (text[:head] + f"\n[… {len(text) - max_chars} chars elided …]\n" + text[-tail:])
+    head  = max_chars // 4
+    tail  = max_chars - head
+    saved = _save_full_output(text)
+    # The path turns "the middle is gone" into something the model can act
+    # on: grep the file for the failing test instead of re-running a suite
+    # that took minutes.
+    where = (f"; full output saved in {saved} - grep or read_file it instead "
+             f"of running the command again" if saved else "")
+    return (text[:head] + f"\n[… {len(text) - max_chars} chars elided{where} …]\n"
+            + text[-tail:])
+
+
+def _save_full_output(text):
+    """Write an oversized tool result to a temp file; its path, or None.
+    Never raises: a full disk only costs the pointer, not the result."""
+    try:
+        folder = os.path.join(tempfile.gettempdir(), "tiny-agent")
+        os.makedirs(folder, exist_ok=True)
+        fd, path = tempfile.mkstemp(prefix="output-", suffix=".txt", dir=folder)
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+        return path
+    except OSError:
+        return None
 
 
 def _similar_paths(path, limit=3):
@@ -829,13 +852,100 @@ TOOLS = {
 }
 
 
+# Names small models reach for from other agents' toolsets. Mapping them
+# costs nothing and saves a round-trip on "[unknown tool]".
+TOOL_ALIASES = {
+    "bash": "run_cmd", "shell": "run_cmd", "sh": "run_cmd", "run": "run_cmd",
+    "exec": "run_cmd", "execute": "run_cmd", "run_command": "run_cmd",
+    "terminal": "run_cmd",
+    "read": "read_file", "cat": "read_file", "view": "read_file",
+    "open": "read_file", "open_file": "read_file", "view_file": "read_file",
+    "write": "edit_file", "write_file": "edit_file", "create_file": "edit_file",
+    "edit": "edit_file", "str_replace": "edit_file", "replace": "edit_file",
+    "append": "append_file",
+    "search": "grep", "rg": "grep", "search_files": "grep",
+    "ls": "list_dir", "list": "list_dir", "list_files": "list_dir",
+    "list_directory": "list_dir",
+    "glob": "find_files", "find": "find_files", "find_file": "find_files",
+    "chdir": "cd",
+}
+
+# Tools that create a file whole: mapped onto edit_file with an empty
+# old_string, which is edit_file's create mode.
+_CREATE_ALIASES = {"write", "write_file", "create_file"}
+
+# Argument names from the same toolsets, tried in order against the real
+# tool's parameters; only applied when the alias isn't itself a parameter
+# and the real one wasn't passed.
+ARG_ALIASES = {
+    "file_path": ("path",), "filepath": ("path",), "file": ("path",),
+    "filename": ("path",), "directory": ("path",), "dir": ("path",),
+    "command": ("cmd",), "old_str": ("old_string",), "new_str": ("new_string",),
+    "old": ("old_string",), "new": ("new_string",),
+    "content": ("new_string", "text"), "contents": ("new_string", "text"),
+    "start_line": ("start",), "end_line": ("end",), "query": ("pattern",),
+    "regex": ("pattern",), "glob": ("pattern", "include"),
+}
+
+
+def tool_name(name):
+    """The real tool a model-supplied name refers to, or None. Tolerates
+    case, a "functions." prefix and the aliases above."""
+    n = (name or "").strip().lower()
+    for prefix in ("functions.", "tools.", "default_api."):
+        if n.startswith(prefix):
+            n = n[len(prefix):]
+    n = TOOL_ALIASES.get(n, n)
+    return n if n in TOOLS else None
+
+
+def _repair_args(raw_name, real, fn, args):
+    params = inspect.signature(fn).parameters
+    fixed  = dict(args)
+    for key in list(fixed):
+        if key in params:
+            continue
+        for target in ARG_ALIASES.get(key.lower(), ()):
+            if target in params and target not in fixed:
+                fixed[target] = fixed.pop(key)
+                break
+    if real == "edit_file" and raw_name in _CREATE_ALIASES:
+        fixed.setdefault("old_string", "")
+    return fixed
+
+
+def _bad_args(name, fn, args):
+    """Name the missing or unknown parameters, and list the real ones. A
+    raw TypeError ("missing 1 required positional argument") is Python's
+    wording about Python; the model needs the tool's parameter names."""
+    params   = inspect.signature(fn).parameters
+    required = [p for p, v in params.items() if v.default is inspect.Parameter.empty]
+    missing  = [p for p in required if p not in args]
+    unknown  = [k for k in args if k not in params]
+    if not (missing or unknown):
+        return None
+    problems = []
+    if missing:
+        problems.append("missing required " + ", ".join(repr(p) for p in missing))
+    if unknown:
+        problems.append("unknown " + ", ".join(repr(k) for k in unknown))
+    return (f"[bad args for {name}: {'; '.join(problems)}. Its parameters are: "
+            f"{', '.join(params)}]")
+
+
 def dispatch(name, args):
-    fn = TOOLS.get(name)
-    if fn is None:
-        return f"[unknown tool: {name}]"
+    real = tool_name(name)
+    if real is None:
+        return f"[unknown tool: {name}. The tools are: {', '.join(TOOLS)}]"
+    fn   = TOOLS[real]
+    raw  = (name or "").strip().lower().split(".")[-1]
+    args = _repair_args(raw, real, fn, args if isinstance(args, dict) else {})
+    bad  = _bad_args(real, fn, args)
+    if bad:
+        return bad
     try:
         return fn(**args)
     except TypeError as e:
-        return f"[bad args for {name}: {e}]"
+        return f"[bad args for {real}: {e}]"
     except Exception as e:
         return f"[tool error: {e}]"

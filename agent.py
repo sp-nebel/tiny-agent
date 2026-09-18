@@ -12,7 +12,7 @@ from rich.markup import escape
 
 import config
 import checkpoint
-from tools import dispatch, read_file, run_shell, CommandInterrupted
+from tools import dispatch, read_file, run_shell, tool_name, CommandInterrupted
 from ollama import call_ollama, warm_cache
 from ui import (read_prompt, read_multiline, fmt_args, truncate, fmt_stats,
                 take_interjections, interjections_pending)
@@ -71,6 +71,17 @@ INTERJECTION_PREFIX = "[user message sent mid-task] "
 STOP_NOTE_PREFIX = ("[the user interrupted you with this note; follow it, "
                     "then continue the task]\n")
 STOP_NOTE_DEFAULT = "Stop and reconsider what you were about to do."
+
+# Added to a tool result when the model has made the identical call and got
+# the identical result REPEAT_CALL_LIMIT times in a row this turn — the doom
+# loop a small model falls into (re-reading one range, re-running one grep).
+# Both call and result must repeat: re-running tests between edits is the
+# normal loop, and its output changes. Part of the result, so it lands at the
+# tail like any tool output and needs no extra model call, unlike the probe.
+REPEAT_CALL_NOTE = ("[you have made this exact {name} call {n} times in a row "
+                    "and got the same result each time. Repeating it will not "
+                    "give new information: use what you have, try a different "
+                    "approach, or give your answer.]")
 
 # Result for a run_cmd the user stopped with Ctrl-C, after whatever it printed.
 USER_STOPPED_CMD = ("[the user stopped this command before it finished; it may "
@@ -407,6 +418,8 @@ def run_turn(messages, max_steps=20, check_every=20):
     # round-trip); sum their stats and print one summary line when the turn
     # finishes, rather than a line per call.
     turn_stats = {}
+    # (tool, canonical args) → (last result, times in a row it came back).
+    repeats = {}
     calls = 0
     step = 0
     since_check = 0
@@ -571,11 +584,14 @@ def run_turn(messages, max_steps=20, check_every=20):
                         except json.JSONDecodeError:
                             args = {}
 
+                    # The model's own name for the tool may be an alias
+                    # ("bash") that dispatch maps; show and record the real one.
+                    shown = tool_name(name) or name
                     # Rich reads any "[word …]" as a markup tag and drops an
                     # unknown one silently, so tool args and results — full of
                     # bracketed metadata like "[lines 1-100 of 543]" — must be
                     # escaped or the user sees them vanish.
-                    config.console.print(f"[cyan]→ {escape(name)}({escape(fmt_args(args))})[/cyan]")
+                    config.console.print(f"[cyan]→ {escape(shown)}({escape(fmt_args(args))})[/cyan]")
                     try:
                         result = dispatch(name, args)
                     except CommandInterrupted as e:
@@ -584,13 +600,19 @@ def run_turn(messages, max_steps=20, check_every=20):
                         # the model acts on. Answer this call with what it
                         # printed; the finally stubs any calls after it.
                         stopped = ((e.output + "\n") if e.output else "") + USER_STOPPED_CMD
-                        messages.append({"role": "tool", "content": stopped, "name": name})
+                        messages.append({"role": "tool", "content": stopped, "name": shown})
                         answered += 1
                         raise
+                    key = (shown, json.dumps(args, sort_keys=True, default=str))
+                    last, n = repeats.get(key, (None, 0))
+                    n = n + 1 if result == last else 1
+                    repeats[key] = (result, n)
+                    if n >= config.REPEAT_CALL_LIMIT:
+                        result += "\n" + REPEAT_CALL_NOTE.format(name=shown, n=n)
                     config.console.print(f"[dim]{escape(truncate(result))}[/dim]\n")
 
                     # Tool results use role "tool", one message per call.
-                    messages.append({"role": "tool", "content": result, "name": name})
+                    messages.append({"role": "tool", "content": result, "name": shown})
                     answered += 1
             finally:
                 for tc in tool_calls[answered:]:

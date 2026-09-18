@@ -119,6 +119,10 @@ SYNTAX_CHECK_TIMEOUT = 20
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv",
              ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 
+# The same tool call returning the same result this many times in a row in
+# one turn gets a "stop repeating this" note appended to its result.
+REPEAT_CALL_LIMIT = 3
+
 AUTO_YES = False
 # Ask the model to emit reasoning in a separate `thinking` field. Streamed
 # live as feedback on slow CPU runs, then discarded once the answer lands.
