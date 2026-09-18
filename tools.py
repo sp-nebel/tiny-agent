@@ -18,6 +18,7 @@ from rich.text import Text
 from rich.markup import escape
 
 import config
+from ui import notify
 
 # --------------------------------------------------------------------------- #
 # Tools (implementations)
@@ -33,6 +34,7 @@ def confirm(msg: str):
     """
     if config.AUTO_YES:
         return True, ""
+    notify("waiting for your confirmation")
     try:
         # Both the message (a path or a shell command can contain brackets)
         # and the literal hint must be escaped: Rich reads a bracketed run
@@ -191,11 +193,15 @@ def _similar_paths(path, limit=3):
 
 def _missing(path, advice=""):
     """"[no such file]" plus the nearest real paths, then `advice`."""
-    msg   = f"[no such file: {path}."
+    extra = []
     close = _similar_paths(path)
     if close:
-        msg += f" Did you mean: {', '.join(close)}?"
-    return msg + (f" {advice}" if advice else "") + "]"
+        extra.append(f"Did you mean: {', '.join(close)}?")
+    if advice:
+        extra.append(advice)
+    if not extra:
+        return f"[no such file: {path}]"
+    return f"[no such file: {path}. {' '.join(extra)}]"
 
 
 def _decode(data):
@@ -933,13 +939,22 @@ def _bad_args(name, fn, args):
             f"{', '.join(params)}]")
 
 
-def dispatch(name, args):
+def normalize_call(name, args):
+    """(real tool name or None, repaired args) — what dispatch will run, so
+    the display can show it too."""
+    args = args if isinstance(args, dict) else {}
     real = tool_name(name)
+    if real is None:
+        return None, args
+    raw = (name or "").strip().lower().split(".")[-1]
+    return real, _repair_args(raw, real, TOOLS[real], args)
+
+
+def dispatch(name, args):
+    real, args = normalize_call(name, args)
     if real is None:
         return f"[unknown tool: {name}. The tools are: {', '.join(TOOLS)}]"
     fn   = TOOLS[real]
-    raw  = (name or "").strip().lower().split(".")[-1]
-    args = _repair_args(raw, real, fn, args if isinstance(args, dict) else {})
     bad  = _bad_args(real, fn, args)
     if bad:
         return bad

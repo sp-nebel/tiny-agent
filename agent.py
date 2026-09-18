@@ -14,10 +14,11 @@ from rich.markup import escape
 
 import config
 import checkpoint
-from tools import dispatch, read_file, run_shell, tool_name, CommandInterrupted
+from tools import dispatch, read_file, run_shell, normalize_call, CommandInterrupted
 from ollama import call_ollama, warm_cache
 from ui import (read_prompt, read_multiline, fmt_args, truncate, fmt_stats,
-                take_interjections, interjections_pending)
+                take_interjections, interjections_pending, mark_turn_start,
+                notify, tool_failed, tool_call_label, tool_outcome)
 from session import *
 
 try:                      # line editing + history for the interactive prompt
@@ -408,6 +409,33 @@ def _add_stats(turn_stats, stats):
     _note_prefill_rate(stats)
 
 
+TOOL_NAMES = ("read_file", "grep", "find_files", "list_dir", "cd",
+              "edit_file", "append_file", "run_cmd")
+
+
+def _show_result(name, label, early, result):
+    """Print a tool call's outcome: one line normally, the body too when it
+    failed or /details is on. Display only — the model gets the full result
+    either way. Rich reads any "[word …]" as a markup tag and drops an
+    unknown one silently, so everything here is escaped."""
+    outcome = tool_outcome(name, result)
+    failed  = tool_failed(name, result)
+    if early:
+        # A failed command's body is printed below and ends with its exit.
+        if outcome and name == "run_cmd" and not failed:
+            config.console.print(f"[dim]  {escape(outcome)}[/dim]")
+    else:
+        tail = f" [dim]({escape(outcome)})[/dim]" if outcome else ""
+        config.console.print(f"[cyan]→ {escape(label)}[/cyan]{tail}")
+    if name in ("edit_file", "append_file") and not config.SHOW_DETAILS:
+        # Their result is itself one short line, plus any syntax warning.
+        config.console.print(f"[{'yellow' if failed else 'dim'}]{escape(result)}[/]")
+    elif config.SHOW_DETAILS or failed:
+        config.console.print(f"[dim]{escape(truncate(result))}[/dim]")
+    if config.SHOW_DETAILS or failed or early:
+        config.console.print()
+
+
 def run_turn(messages, max_steps=20, check_every=20):
     # max_steps <= 0 means unlimited: no forced final step, no nudge.
     # check_every > 0 asks the model every that many tool steps whether it is
@@ -420,6 +448,7 @@ def run_turn(messages, max_steps=20, check_every=20):
     # round-trip); sum their stats and print one summary line when the turn
     # finishes, rather than a line per call.
     turn_stats = {}
+    mark_turn_start()
     # (tool, canonical args) → (last result, times in a row it came back).
     repeats = {}
     calls = 0
@@ -430,6 +459,7 @@ def run_turn(messages, max_steps=20, check_every=20):
     # them at the end and clean up what was fed back across the turn's tool
     # round-trips.
     turn_start = len(messages)
+    t0 = time.monotonic()
     try:
         while max_steps <= 0 or step < max_steps:
             deliver_interjections(messages)
@@ -475,8 +505,6 @@ def run_turn(messages, max_steps=20, check_every=20):
                     config.console.print("[yellow]model reports it is stuck after "
                                          f"{step} steps — handing back to you[/yellow]")
                     config.console.print(Markdown(content))
-                    if turn_stats:
-                        config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
                     return
                 # CONTINUE, a tool call, or anything else: the probe is
                 # discarded and work goes on with a fresh budget.
@@ -553,8 +581,6 @@ def run_turn(messages, max_steps=20, check_every=20):
                     config.console.print("[yellow]hit step limit; model returned no answer[/yellow]")
                 else:
                     config.console.print("[yellow]model returned an empty answer[/yellow]")
-                if turn_stats:
-                    config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
                 return
 
             # The model addressed the user before calling its tools. That text
@@ -588,12 +614,19 @@ def run_turn(messages, max_steps=20, check_every=20):
 
                     # The model's own name for the tool may be an alias
                     # ("bash") that dispatch maps; show and record the real one.
-                    shown = tool_name(name) or name
+                    real, fixed = normalize_call(name, args)
+                    shown = real or name
                     # Rich reads any "[word …]" as a markup tag and drops an
                     # unknown one silently, so tool args and results — full of
                     # bracketed metadata like "[lines 1-100 of 543]" — must be
                     # escaped or the user sees them vanish.
-                    config.console.print(f"[cyan]→ {escape(shown)}({escape(fmt_args(args))})[/cyan]")
+                    # Tools that print (a diff, a confirmation prompt) or can
+                    # run long get their call line up front; the quick
+                    # read-only ones get one line afterwards, with the outcome.
+                    label = tool_call_label(shown, fixed)
+                    early = shown in ("run_cmd", "edit_file", "append_file") or shown not in TOOL_NAMES
+                    if early:
+                        config.console.print(f"[cyan]→ {escape(label)}[/cyan]")
                     try:
                         result = dispatch(name, args)
                     except CommandInterrupted as e:
@@ -611,7 +644,7 @@ def run_turn(messages, max_steps=20, check_every=20):
                     repeats[key] = (result, n)
                     if n >= config.REPEAT_CALL_LIMIT:
                         result += "\n" + REPEAT_CALL_NOTE.format(name=shown, n=n)
-                    config.console.print(f"[dim]{escape(truncate(result))}[/dim]\n")
+                    _show_result(shown, label, early, result)
 
                     # Tool results use role "tool", one message per call.
                     messages.append({"role": "tool", "content": result, "name": shown})
@@ -650,6 +683,11 @@ def run_turn(messages, max_steps=20, check_every=20):
         if stubbed:
             config.console.print(f"[dim]compacted {stubbed} tool output"
                           f"{'s' if stubbed != 1 else ''} from this turn[/dim]")
+        # After the cleanup, so ctx% is what the next turn starts from.
+        if turn_stats:
+            pct = 100 * _total_tokens(messages) // config.NUM_CTX
+            config.console.print(f"[dim]{fmt_stats(turn_stats, calls, time.monotonic() - t0, pct)}[/dim]")
+        notify("turn finished")
 
 # --------------------------------------------------------------------------- #
 # First-message context
@@ -1001,6 +1039,16 @@ def main():
             del pending_shell[:]
             first_user_msg = True
             config.console.print("[dim]context cleared (system prompt preserved)[/dim]\n")
+            continue
+        if user.lower() in ("/details", "/thinking"):
+            # Display only: what the model is sent (and the `think` flag,
+            # which would change the prompt template) stays as it was.
+            attr = "SHOW_DETAILS" if user.lower() == "/details" else "SHOW_THINKING"
+            setattr(config, attr, not getattr(config, attr))
+            what = ("full tool results" if attr == "SHOW_DETAILS"
+                    else "the model's reasoning while it streams")
+            config.console.print(f"[dim]{'showing' if getattr(config, attr) else 'hiding'} "
+                                 f"{what}[/dim]\n")
             continue
         if user.lower() == "/sessions":
             files = list_sessions()

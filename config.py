@@ -142,6 +142,17 @@ AUTO_YES = False
 # Auto-disabled at runtime if the model doesn't support thinking.
 THINK = os.environ.get("AGENT_THINK", "1") not in ("0", "false", "")
 
+# Bell + desktop notification when a turn ends or a confirmation waits,
+# once the turn has run at least NOTIFY_AFTER seconds. AGENT_NOTIFY=0 turns
+# it off.
+NOTIFY       = os.environ.get("AGENT_NOTIFY", "1") not in ("0", "false", "")
+NOTIFY_AFTER = 20
+
+# Display toggles, flipped by /details and /thinking. Neither changes what
+# the model is sent.
+SHOW_DETAILS  = False   # full tool results under each call, not just failures
+SHOW_THINKING = True    # the live reasoning view while a reply streams
+
 console = Console()
 
 # --------------------------------------------------------------------------- #

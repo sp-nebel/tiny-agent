@@ -35,7 +35,7 @@ def test_missing_file_did_you_mean(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "agent.py").write_text("")
     assert read_file("agnet.py") == "[no such file: agnet.py. Did you mean: agent.py?]"
-    assert read_file("zzzz.qq") == "[no such file: zzzz.qq.]"
+    assert read_file("zzzz.qq") == "[no such file: zzzz.qq]"
 
 
 def test_line_numbers_follow_universal_newlines(tmp_path):

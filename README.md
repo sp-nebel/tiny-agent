@@ -51,6 +51,7 @@ python local_agent.py
 | `AGENT_THINK` | `1` | Set to `0` to disable reasoning output |
 | `AGENT_NUM_CTX` | `24576` | Ollama context window size; lower on memory-constrained machines |
 | `AGENT_SYNTAX_CHECKS` | none | JSON object mapping file extensions to a syntax-check command run after an edit, with `{path}` as the placeholder, e.g. `{".js": "node --check {path}", ".sh": "bash -n {path}"}`. `.py` and `.json` are checked without it |
+| `AGENT_NOTIFY` | `1` | Set to `0` to turn off the bell and desktop notification (OSC 777 on VTE terminals, OSC 9 elsewhere) sent when a turn that ran 20s or more finishes, or when a confirmation prompt is waiting in such a turn |
 | `AGENT_STREAM_TIMEOUT` | `300` | Per-read socket timeout (s) on streaming calls; fires only when nothing arrives at all. The call right after a trim pass instead gets a timeout sized to its full re-prefill (estimated tokens ÷ measured prefill rate) |
 
 ### Interactive commands
@@ -62,6 +63,8 @@ python local_agent.py
 | `/save [NAME]` | Save the current conversation as a session (defaults to a timestamp) |
 | `/resume [NAME]` | Resume a saved session; bare `/resume` resumes the most recent |
 | `/sessions` | List saved sessions |
+| `/details` | Toggle full tool results under each call. Off by default: each call is one line (`→ read agent.py:10-40 (10-40 of 543)`, `→ grep "foo" (7 matches)`, `→ run_cmd pytest` then `exit 0`), and a result's body is shown only when the call failed |
+| `/thinking` | Toggle the live view of the model's reasoning while it streams. Display only: the model still thinks, and the request is unchanged |
 | `!cmd` | Run a shell command yourself; its output (and exit code) is shown and goes to the model ahead of your next message. It runs in a subshell, so `!cd` has no lasting effect |
 | `!!cmd` | Same, but the output is only shown to you, never sent to the model |
 | Line ending in `\` | Continue the prompt on the next line (a dim `...` prompt); the lines are sent as one message. A multi-line paste needs no backslashes — it already arrives as one message |
@@ -99,7 +102,7 @@ A model that calls a tool by another agent's name (`bash`, `cat`, `write_file`, 
 
 **Security note:** `--yes` auto-approves every write and shell command with no confirmation, and `run_cmd` executes with `shell=True`, so the model can run anything a real shell command can. Only use `--yes` in a repo/directory you trust the agent with.
 
-After each model turn a dim stats line is printed, e.g. `prefill 142 tok in 3.2s · gen 56 tok @ 8.4 tok/s`. The prefill count covers only tokens *not* served from the KV prefix cache, so a small number on a long conversation means the prefix caching is working.
+After each model turn a dim stats line is printed, e.g. `3 steps · prefill 142 tok in 3.2s · gen 56 tok @ 8.4 tok/s · 1m12s total · ctx ~41%`. The prefill count covers only tokens *not* served from the KV prefix cache, so a small number on a long conversation means the prefix caching is working. `total` is the turn's wall time, tools and confirmation waits included, and `ctx` is the estimated share of the context window the conversation now fills (trimming starts at ~70%). While a reply streams, the live region also shows how many typed messages are queued for the model.
 
 ## Design notes
 
@@ -137,7 +140,8 @@ Newest first. Every commit adds its entry here (see `CLAUDE.md`).
 
 ### 2026-09-18
 
-- **Retry with backoff**: a request to Ollama that fails before anything streams (connection refused or reset, HTTP 429/500/502/503/504) is retried up to 5 times with exponential backoff (2s doubling to 30s, with jitter), instead of a single retry on a refused connection. A context overflow and any 4xx are never retried.
+- **Quieter tool display, `/details`, `/thinking`, richer stats, notifications**: each tool call now prints one line with its outcome (`→ grep "foo" (7 matches)`), and a result's body appears only when the call failed or `/details` is on. `/thinking` hides the live reasoning view without changing the request. The stats line adds the turn's total time and the share of the context window in use, and the live region counts queued messages. A turn that ran 20s or more rings the bell and sends a desktop notification when it ends or waits for a confirmation (`AGENT_NOTIFY=0` turns this off).
+- **Retry with backoff** (`67adeff`): a request to Ollama that fails before anything streams (connection refused or reset, HTTP 429/500/502/503/504) is retried up to 5 times with exponential backoff (2s doubling to 30s, with jitter), instead of a single retry on a refused connection. A context overflow and any 4xx are never retried.
 - **`AGENTS.md` / `CLAUDE.md` instructions** (`f88b792`): the first message of a conversation now carries `~/.config/tiny-agent/AGENTS.md` and the nearest project `AGENTS.md` or `CLAUDE.md` (walking up to the git root), each cut at 3000 chars. The environment line also says whether the directory is a git repo, the platform, and the date. The system prompt is unchanged, so the cached prefix is unaffected.
 - **Saved full output, tool-name repair, repeat detection** (`fa098a9`): a tool result cut in the middle is also saved to a temp file, and the notice tells the model to grep or read that file instead of re-running a slow command. Tool names and argument names from other toolsets (`bash`, `cat`, `write_file`, `command`, `file_path`) are mapped onto the real tools, an unknown tool name gets the list of valid ones, and bad arguments are named along with the tool's parameters. The third identical call in a row that returns an identical result gets a note telling the model to stop repeating it.
 - **Forgiving `edit_file`, syntax check after writes, friendlier `read_file`** (`0f67103`): when `old_string` isn't found exactly, `edit_file` tries whole-line matches ignoring trailing whitespace, then indentation (re-indenting `new_string` to fit), then curly quotes and dashes. The match must be unique, and the result names the fallback used. After an edit or append to a `.py` or `.json` file, a syntax error the write introduced is reported in one line (more languages via `AGENT_SYNTAX_CHECKS`). `read_file` ends a complete read with `[end of file, N lines]`, lists a directory instead of failing, shows latin-1 files instead of calling them binary, and a missing path in `read_file` or `edit_file` comes with "did you mean" suggestions. An edit whose two strings are identical is refused.

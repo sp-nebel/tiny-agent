@@ -118,8 +118,10 @@ Run `python3 local_agent.py` and exercise:
   pending tool call must NOT run, and the model's next step follows the note. Tab inside the
   `interject` prompt is readline completion, not a stop.
 - The `[y/N/reason]` hint is visible on a confirmation prompt, and bracketed tool results
-  (`[lines 1-100 of 543 …]`) appear under their `→ tool(...)` line (Rich would swallow them
-  unescaped).
+  (`[lines 1-100 of 543 …]`) appear under their `→ tool …` line with `/details` on, or
+  when the call failed (Rich would swallow them unescaped).
+- `/details` and `/thinking` toggle the display only; a turn that runs 20s+ ends with a
+  bell (and a desktop notification on terminals that support OSC 9/777).
 - Ctrl-C while a tool is running — the turn aborts but history stays well-formed
   (stub `[interrupted before this tool ran]` results pair up any pending tool_calls).
   Ctrl-C during `run_cmd` answers that call with its partial output plus
