@@ -77,14 +77,16 @@ non-obvious ways. Any change must preserve:
 - **Comments explain why, never what.** Every non-obvious decision gets a comment or docstring
   stating the rationale and the failure mode it prevents (read `trim_history`'s docstring for
   the house style). If you make a judgment call, write down why. Match this density — it is
-  the project's substitute for tests and design docs.
+  the project's substitute for design docs.
 - Dependencies: stdlib + `rich`. HTTP via `urllib`, not `requests`. Python 3.8+ compatible —
   no `match`, no `X | Y` type syntax. No type annotations are used; don't introduce them.
 - Narrow exception tuples (`except (OSError, ValueError):`), never bare `except` — the sole
   broad catch is `dispatch`'s tool-error boundary.
 - Visual style: aligned assignment blocks (`content    = ""`), section-divider banners
   (`# ---- #`), Rich markup for all console output (`[dim]`, `[yellow]`, `[red]`).
-- No test suite, no CI. **The README is the spec**: any user-visible change must update its
+- Tests live in `tests/` (pytest, no CI; how to run and extend them is in
+  `verifying-tiny-agent`). Behavior changes land with their tests in the same commit.
+- **The README is the spec**: any user-visible change must update its
   tables (flags, env vars, interactive commands, tools) and Design notes section, plus the
   `local_agent.py` docstring. Git history shows doc drift gets flagged and fixed in review;
   don't create it.

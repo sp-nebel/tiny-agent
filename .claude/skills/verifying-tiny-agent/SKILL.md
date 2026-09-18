@@ -1,13 +1,13 @@
 ---
 name: verifying-tiny-agent
-description: How to run and verify tiny-agent after a change — there is no test suite or CI. Covers the static compile pass, in-process harnesses for logic that doesn't need Ollama, the live smoke test and how to read the prefill stats line to prove the KV cache survived, the interactive-path checklist, and the docs that must stay in sync. Use when testing, running, launching, or verifying this project.
+description: How to run and verify tiny-agent after a change — there is a pytest suite under tests/ but no CI. Covers the static compile pass, the test suite, in-process harnesses for logic that doesn't need Ollama, the live smoke test and how to read the prefill stats line to prove the KV cache survived, the interactive-path checklist, and the docs that must stay in sync. Use when testing, running, launching, or verifying this project.
 ---
 
 # Verifying tiny-agent changes
 
-There is no test suite and no CI. Verification is: compile check → in-process harness for the
-changed logic → live smoke test when behavior warrants it → doc sync. Do the first two always;
-they need nothing but Python.
+There is a pytest suite under `tests/` but no CI, so nothing runs it for you. Verification is:
+compile check → test suite → in-process harness for the changed logic → live smoke test when
+behavior warrants it → doc sync. Do the first three always; they need nothing but Python.
 
 ## 1. Static pass (always)
 
@@ -18,10 +18,36 @@ python3 -m py_compile local_agent.py agent.py config.py ollama.py tools.py sessi
 Silence means success. Also confirm nothing imported a new third-party package — the
 dependency policy is stdlib + `rich` only, Python 3.8+.
 
-## 2. In-process harness (always, for the logic you changed)
+## 2. Test suite (always)
+
+```bash
+python3 -m venv venv && venv/bin/pip install rich pytest   # once; venv/ is gitignored
+venv/bin/python -m pytest -q
+```
+
+No Ollama needed: `tests/test_run_turn.py` drives `run_turn` with a scripted fake in place of
+`agent.call_ollama` (plus `agent.dispatch` and `agent.read_prompt`), and the tool tests run
+against `tmp_path`. Every test must pass before you commit. pytest is a dev-only dependency;
+it stays out of `requirements.txt`, which lists what the agent itself needs.
+
+When you change behavior, change or add the test that pins it in the same commit. A failing
+test that asserts the *old* behavior means the test is stale (fix the test), not that the
+change is wrong. A new feature gets tests too:
+
+- History handling (`run_turn`, nudges, interjections, trimming): script the fake model in
+  `test_run_turn.py`. Nudges are stripped in `run_turn`'s `finally`, so assert anything
+  transient on the per-call snapshots `FakeModel.calls` records, and the end state with
+  `assert_well_formed`.
+- Tools: one file per tool (`test_<tool>.py`). Set `config.AUTO_YES`, or monkeypatch
+  `tools.confirm` to test a decline.
+- Tunables: monkeypatch `config.*` instead of relying on defaults, so retuning a threshold
+  doesn't break unrelated tests.
+
+## 3. In-process harness (always, for the logic you changed)
 
 Most of the interesting logic is pure functions over a `messages` list or strings, and the
-tools run without any server. Exercise the changed function directly with `python3 -c` or a
+tools run without any server. The suite covers the common paths; for a quick look at a changed
+function, or an edge case not worth a permanent test, call it directly with `python3 -c` or a
 short throwaway script. Examples to adapt:
 
 ```bash
@@ -50,7 +76,7 @@ invariants from `working-on-tiny-agent` on the resulting list: system prompt sti
 every assistant `tool_calls` answered by tool messages, no `thinking` or nudges left after the
 turn.
 
-## 3. Live smoke test (when behavior toward Ollama changed)
+## 4. Live smoke test (when behavior toward Ollama changed)
 
 Needs a running Ollama ≥ 0.20.2 with a tool-capable model pulled (default
 `gemma4:12b-it-qat`; override with `--model` or `AGENT_MODEL`; server via `OLLAMA_URL`).
@@ -78,7 +104,7 @@ If the model isn't available, `ollama pull gemma4:12b-it-qat` or use any tool-ca
 you have. Do not silently skip this step when you changed `ollama.py` payloads or streaming —
 report that it wasn't run and why.
 
-## 4. Interactive-path checklist (when you touched `main()`, session.py, or ui.py)
+## 5. Interactive-path checklist (when you touched `main()`, session.py, or ui.py)
 
 Run `python3 local_agent.py` and exercise:
 
@@ -102,7 +128,7 @@ Run `python3 local_agent.py` and exercise:
   must answer promptly — if it hangs for minutes, the abandoned generation wasn't torn down
   (`ollama._abort_stream`).
 
-## 5. Doc sync (always, for user-visible changes)
+## 6. Doc sync (always, for user-visible changes)
 
 The README is the spec. Update, as applicable: the flags / env vars / interactive commands /
 tools tables, the Design notes section, and the `local_agent.py` module docstring (usage and
