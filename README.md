@@ -74,7 +74,7 @@ Esc is the only key that cancels, and only on its own: arrow keys and other esca
 | `find_files` | Glob-pattern file search |
 | `list_dir` | List directory contents |
 | `cd` | Change the working directory |
-| `edit_file` | Exact-string replacement edit, or create a new file |
+| `edit_file` | Exact-string replacement edit, or create a new file (an empty existing file counts as new) |
 | `run_cmd` | Run a shell command |
 
 `edit_file` and `run_cmd` ask for confirmation before executing unless `--yes` is passed. Edits show a colored unified diff before the confirmation prompt (and under `--yes`, as a record of what changed). The prompt is `[y/N/reason]`: `y` approves, empty/`n` declines, and anything else declines *and* is passed back to the model as the reason — `use the test runner, not python directly` redirects it, where a bare refusal tends to make a small model re-issue the identical call.

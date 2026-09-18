@@ -290,8 +290,21 @@ def cd(path):
 def edit_file(path, old_string, new_string, replace_all=False):
     # Empty old_string ⇒ create a new file (the write_file behaviour, folded in).
     if old_string == "":
-        if os.path.exists(path):
-            return f"[{path} already exists; put the text to replace in old_string]"
+        # An existing but *empty* file is treated like a missing one: small
+        # models routinely make a file first (run_cmd touch, or a create call
+        # with empty new_string) and then try to fill it, and the old
+        # "already exists; put the text to replace in old_string" answer left
+        # them no legal move — there is nothing in an empty file to put in
+        # old_string — so they escaped to shell redirection. A non-empty file
+        # still refuses: silently overwriting it would be a different tool.
+        try:
+            nonempty = os.path.exists(path) and os.path.getsize(path) > 0
+        except OSError as e:
+            return f"[error reading {path}: {e}]"
+        if nonempty:
+            return (f"[{path} already exists and has content. Pass the exact text "
+                    f"to replace in old_string; an empty old_string only creates a "
+                    f"new file or fills an empty one]")
         show_diff("", new_string, path)
         ok, reason = confirm(f"create {path} ({len(new_string)} chars)?")
         if not ok:
