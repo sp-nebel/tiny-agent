@@ -405,3 +405,35 @@ def test_strip_nudges_keeps_real_user_input(env):
     assert contents(messages) == [config.SYSTEM, "do the task",
                                   INTERJECTION_PREFIX + "hi", STOP_NOTE_PREFIX + "stop",
                                   "", "r"]
+
+
+# ---- /undo cut points ------------------------------------------------------ #
+
+def test_undo_cut_points_survive_turn_end_cleanup(env):
+    """/undo records len(messages) before each turn's user message and cuts
+    there later. That only holds if turn-end cleanup never removes anything
+    before the turn it runs for — strip_nudges and drop_thinking work from
+    turn_start on. Pin it with a turn whose nudge gets stripped."""
+    from agent import undo_last_turn
+    env["install"]([
+        reply(),                                     # empty -> nudge, stripped later
+        reply(thinking="t", tool_calls=[call()]),
+        reply(content="first done"),
+        reply(content="second done"),
+    ])
+    messages = [{"role": "system", "content": config.SYSTEM}]
+    turns    = []
+    for prompt in ("one", "two"):
+        turns.append({"msg_index": len(messages), "prompt": prompt, "first": False,
+                      "cwd": ".", "snap": None})
+        messages.append({"role": "user", "content": prompt})
+        run_turn(messages)
+    after_first = [dict(m) for m in messages[:turns[1]["msg_index"]]]
+
+    undo_last_turn(messages, turns)
+    assert messages == after_first
+    assert contents(messages)[-1] == "first done"
+    assert_well_formed(messages)
+
+    undo_last_turn(messages, turns)
+    assert messages == [{"role": "system", "content": config.SYSTEM}]

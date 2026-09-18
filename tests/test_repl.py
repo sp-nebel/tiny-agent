@@ -1,6 +1,7 @@
 """main()'s REPL over scripted prompt input, with run_turn and the warmup
-stubbed out — the prompt-level features (`!cmd`, `!!cmd`, `@file`, `/undo`, `\` continuation) are
-pure bookkeeping on the message list and need no model."""
+stubbed out — the prompt-level features (`!cmd`, `!!cmd`, `@file`, `/undo`,
+trailing-backslash continuation) are pure bookkeeping on the message list
+and need no model."""
 import subprocess
 
 import pytest
@@ -122,3 +123,10 @@ def test_backslash_continues_the_prompt(monkeypatch, tmp_path):
     r = Repl(monkeypatch, ["first line \\", "  second\\", "third", "next"]).run()
     assert r.turns[0].endswith("first line \n  second\nthird")
     assert r.turns[1] == "next"
+
+
+def test_undoing_a_multiline_prompt_does_not_prefill_it(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    r = Repl(monkeypatch, ["a \\", "b", "/undo"]).run()
+    assert r.turns[0].endswith("a \nb")
+    assert r.seeds[-1] == ""              # readline can't hold the newline

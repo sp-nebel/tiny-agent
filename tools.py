@@ -414,7 +414,7 @@ def append_file(path, text):
             f"{len(new_content.splitlines())} lines]")
 
 
-def _run_shell(cmd):
+def run_shell(cmd):
     """Run `cmd` in a shell: (capped combined output, exit code), or (None,
     None) on timeout. Shared by run_cmd and the user's `!cmd` prompt escape,
     so both see the same cap and timeout."""
@@ -434,7 +434,7 @@ def run_cmd(cmd):
     ok, reason = confirm(f"run: {cmd}")
     if not ok:
         return declined("command", reason)
-    combined, code = _run_shell(cmd)
+    combined, code = run_shell(cmd)
     if code is None:
         return f"[timed out after {config.CMD_TIMEOUT}s]"
     return combined or f"[exit {code}, no output]"

@@ -12,7 +12,7 @@ from rich.markup import escape
 
 import config
 import checkpoint
-from tools import dispatch, read_file, _run_shell
+from tools import dispatch, read_file, run_shell
 from ollama import call_ollama, warm_cache
 from ui import (read_prompt, read_multiline, fmt_args, truncate, fmt_stats,
                 take_interjections, interjections_pending)
@@ -628,11 +628,11 @@ def run_shell_escape(cmd):
     """Run a `!cmd` / `!!cmd` typed at the prompt, show its output, and
     return it as a block for the model. No confirmation: the user typed it.
 
-    Runs through the same _run_shell as the model's run_cmd, so the output
+    Runs through the same run_shell as the model's run_cmd, so the output
     the model gets is capped the same way. A subshell, so `!cd` changes
     nothing that outlives it.
     """
-    output, code = _run_shell(cmd)
+    output, code = run_shell(cmd)
     if code is None:
         status = f"timed out after {config.CMD_TIMEOUT}s"
         output = ""
@@ -691,8 +691,9 @@ def undo_last_turn(messages, turns):
     Cache impact: the cut is at the tail, so the retained history is exactly
     a prefix of what was last sent. A full-attention model keeps that prefix
     cached; on an SWA model (gemma) rolling back is the same kind of edit as
-    a trim and costs one re-prefill of what remains — paid once, at a moment
-    the user chose, and hidden by the warmup main starts right after.
+    a trim — at most one re-prefill of what remains (possibly just a
+    checkpoint restore; unmeasured) — paid once, at a moment the user chose,
+    and hidden by the warmup main starts right after.
     """
     if not turns:
         config.console.print("[dim]nothing to undo[/dim]\n")
@@ -709,7 +710,7 @@ def undo_last_turn(messages, turns):
                                  "rewound, files untouched[/yellow]")
         for status, path in changes or []:
             verb = "removed" if status == "A" else "restored"
-            config.console.print(f"[dim]{verb} {escape(status)} {escape(path)}[/dim]")
+            config.console.print(f"[dim]{verb} {escape(path)}[/dim]")
         if head_moved:
             config.console.print("[yellow]HEAD moved during that turn; its "
                                  "commits were kept (files restored only)[/yellow]")
@@ -717,8 +718,14 @@ def undo_last_turn(messages, turns):
     del messages[rec["msg_index"]:]
     with contextlib.suppress(OSError):
         os.chdir(rec["cwd"])
-    config.console.print(f"[dim]undid the last turn ({len(messages)} messages "
-                         f"left); its prompt is back in the input line[/dim]\n")
+    if "\n" in rec["prompt"]:
+        # readline edits one line; a multi-line prompt inserted into it
+        # garbles the display, so show it instead of pre-filling it.
+        config.console.print(f"[dim]undid the last turn ({len(messages)} messages "
+                             f"left); its prompt was:[/dim]\n{escape(rec['prompt'])}\n")
+    else:
+        config.console.print(f"[dim]undid the last turn ({len(messages)} messages "
+                             f"left); its prompt is back in the input line[/dim]\n")
     return rec
 
 # --------------------------------------------------------------------------- #
@@ -916,7 +923,7 @@ def main():
             rec = undo_last_turn(messages, turns)
             if rec:
                 first_user_msg = rec["first"]
-                seed           = rec["prompt"]
+                seed           = "" if "\n" in rec["prompt"] else rec["prompt"]
                 threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
             continue
         if not user:
