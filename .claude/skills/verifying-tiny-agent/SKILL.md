@@ -87,6 +87,13 @@ Run `python3 local_agent.py` and exercise:
   `/sessions` lists it with a `*` on the active one.
 - Esc during a streaming reply — prints `cancelled`, returns to the prompt, and the
   partial reply is NOT in history (ask a follow-up to confirm the model never saw it).
+- Typing during a streaming reply opens `interject`; the message is echoed as `you …` after
+  the current step's tool results. Tab during a reply stops it at once and opens `steer`; the
+  pending tool call must NOT run, and the model's next step follows the note. Tab inside the
+  `interject` prompt is readline completion, not a stop.
+- The `[y/N/reason]` hint is visible on a confirmation prompt, and bracketed tool results
+  (`[lines 1-100 of 543 …]`) appear under their `→ tool(...)` line (Rich would swallow them
+  unescaped).
 - Ctrl-C while a tool is running — the turn aborts but history stays well-formed
   (stub `[interrupted before this tool ran]` results pair up any pending tool_calls).
 - A multi-line paste arrives as one prompt, not one prompt per line.
