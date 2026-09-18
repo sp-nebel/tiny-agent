@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import atexit
 import argparse
@@ -11,7 +12,7 @@ from rich.markup import escape
 
 import config
 import checkpoint
-from tools import dispatch, _run_shell
+from tools import dispatch, read_file, _run_shell
 from ollama import call_ollama, warm_cache
 from ui import (read_prompt, fmt_args, truncate, fmt_stats,
                 take_interjections, interjections_pending)
@@ -642,6 +643,41 @@ def run_shell_escape(cmd):
     config.console.print(f"[dim]{escape(status)}[/dim]")
     return SHELL_BLOCK_HEAD.format(cmd=cmd, status=status) + "\n" + (output or "[no output]")
 
+# An `@path` token: at the start of the prompt or after whitespace, so an
+# email address or a decorator in pasted code is not one.
+FILE_REF_RE     = re.compile(r"(?<!\S)@(\S+)")
+# Punctuation that ends a sentence around a path ("look at @agent.py.") rather
+# than belonging to it; stripped only when the token as typed isn't a file.
+FILE_REF_TRAIL  = ".,;:!?)]}'\""
+FILE_BLOCK_HEAD = "[contents of {path}, attached by the user]"
+
+
+def expand_file_refs(text):
+    """Append the contents of every `@path` in `text` that names an existing
+    file, each once, after the text itself.
+
+    The contents come from read_file, so an attachment is exactly what the
+    model's own first read of the file would return: numbered lines, the same
+    100-line and size caps, and for a longer file the same imperative telling
+    it how to read on. Attaching a big file therefore costs one read_file
+    call's worth of prefill, not the whole file. Tokens that aren't files
+    (an @mention, a path that doesn't exist) are left alone, and the @token
+    stays in the text so the request still reads naturally.
+    """
+    blocks = []
+    seen   = set()
+    for m in FILE_REF_RE.finditer(text):
+        path = m.group(1)
+        if not os.path.isfile(os.path.expanduser(path)):
+            path = path.rstrip(FILE_REF_TRAIL)
+        full = os.path.expanduser(path)
+        if not path or not os.path.isfile(full) or full in seen:
+            continue
+        seen.add(full)
+        blocks.append(FILE_BLOCK_HEAD.format(path=path) + "\n" + read_file(full))
+        config.console.print(f"[dim]attached {escape(path)}[/dim]")
+    return "\n\n".join([text] + blocks)
+
 # --------------------------------------------------------------------------- #
 # Undo
 # --------------------------------------------------------------------------- #
@@ -782,7 +818,7 @@ def main():
         "streams, just start typing to queue a message for the model; Tab "
         "stops the reply now so you can steer it; Esc cancels the reply. "
         "'!cmd' runs a shell command and sends its output with your next "
-        "message ('!!cmd': shown only to you), '/undo' to take back the last turn (files too, in a git repo), "
+        "message ('!!cmd': shown only to you), '@path' attaches a file, '/undo' to take back the last turn (files too, in a git repo), "
         "'/clear' to reset context, '/save', '/resume', "
         "'/sessions' to pause/switch conversations (each takes an optional "
         "name), 'exit' to quit.[/dim]\n"
@@ -896,7 +932,7 @@ def main():
         # session. Computed here, not once at startup, so a `cd` tool call or
         # a `/clear` (which resets first_user_msg) picks up the current
         # directory instead of whatever it was when the process started.
-        content        = "\n\n".join(pending_shell + [user])
+        content        = "\n\n".join(pending_shell + [expand_file_refs(user)])
         content        = (f"Working directory: {os.getcwd()}\n\n" + content) if first_user_msg else content
         del pending_shell[:]
         first_user_msg = False

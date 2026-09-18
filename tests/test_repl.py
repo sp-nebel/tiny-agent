@@ -1,5 +1,5 @@
 """main()'s REPL over scripted prompt input, with run_turn and the warmup
-stubbed out — the prompt-level features (`!cmd`, `!!cmd`, `/undo`) are
+stubbed out — the prompt-level features (`!cmd`, `!!cmd`, `@file`, `/undo`) are
 pure bookkeeping on the message list and need no model."""
 import subprocess
 
@@ -103,3 +103,12 @@ def test_undoing_the_first_turn_reinjects_the_cwd(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     r = Repl(monkeypatch, ["one", "/undo", "one again"]).run()
     assert r.turns[1] == f"Working directory: {tmp_path}\n\none again"
+
+
+def test_file_ref_is_attached_but_prompt_seed_stays_raw(monkeypatch, tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "a.py").write_text("x = 1\n")
+    monkeypatch.chdir(tmp_path)
+    r = Repl(monkeypatch, ["fix @a.py", "/undo"]).run()
+    assert "[contents of a.py, attached by the user]" in r.turns[0]
+    assert r.seeds[2] == "fix @a.py"

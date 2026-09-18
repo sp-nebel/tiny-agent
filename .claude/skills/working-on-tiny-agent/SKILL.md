@@ -34,7 +34,7 @@ read `verifying-tiny-agent`.
   `drop_thinking` and `strip_nudges` (turn-boundary cleanup, invoked from `run_turn`'s
   `finally`, which also stubs the finished turn's oversized tool outputs), `main()` (CLI +
   REPL with `/clear`, `/save`, `/resume`, `/sessions`, `/undo`, `!cmd`/`!!cmd` (output held in `pending_shell` and prepended to the
-  next prompt's user message); `undo_last_turn` pops a
+  next prompt's user message), `@path` attachments (`expand_file_refs`, via `read_file`); `undo_last_turn` pops a
   per-turn record and cuts history back to where that turn began).
 - `ollama.py` — HTTP layer. `_build_payload` is the **single source of truth for request
   bodies**; both call sites (`call_ollama`, `warm_cache`) go through it so
