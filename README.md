@@ -60,7 +60,7 @@ python local_agent.py
 | `/save [NAME]` | Save the current conversation as a session (defaults to a timestamp) |
 | `/resume [NAME]` | Resume a saved session; bare `/resume` resumes the most recent |
 | `/sessions` | List saved sessions |
-| Any key during a reply | Pauses the stream and opens an `interject` prompt for a message to the model; the key you typed becomes the first character of the line. Delivered at the next step boundary (after the current tool round-trip finishes), or as the next prompt if the turn ends first. Submit an empty line to think better of it |
+| Any other key during a reply | Pauses the stream and opens an `interject` prompt for a message to the model; the key you typed becomes the first character of the line. Delivered at the next step boundary (after the current tool round-trip finishes), or as the next prompt if the turn ends first. Submit an empty line to think better of it |
 | Tab during a reply | Stop the reply now and steer it: the text and reasoning so far stay in context, any tool call it had started is dropped unrun, and a `steer` prompt asks for a note the model must follow before continuing (empty = "stop and reconsider"). Costs no step. Inside the `interject` prompt Tab is ordinary line-editing completion, not a stop |
 | Esc during a reply | Cancel the in-flight response |
 | Up / Down arrows | Recall previous prompts (history persists in `~/.tiny_agent_history`) |
