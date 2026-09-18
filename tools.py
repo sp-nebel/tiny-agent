@@ -319,8 +319,11 @@ def edit_file(path, old_string, new_string, replace_all=False):
             return f"[error writing {path}: {e}]"
         return f"[created {path}, {len(new_string)} chars]"
 
+    # Read and write the raw bytes (newline=""): a default-mode round trip
+    # translates every CRLF to LF, so a one-line edit silently rewrote the
+    # line endings of a whole Windows-style file.
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", newline="") as f:
             content = f.read()
     except FileNotFoundError:
         return f"[no such file: {path}; pass an empty old_string to create it]"
@@ -329,14 +332,28 @@ def edit_file(path, old_string, new_string, replace_all=False):
     except OSError as e:
         return f"[error reading {path}: {e}]"
 
+    # The model saw the file through read_file, which shows LF, so its
+    # strings are LF. Convert them to the file's ending and match the raw
+    # text, rather than normalising the file, so every byte outside the
+    # replacement is left exactly as it was — a file with mixed endings
+    # included. Such a file may hold the target with LF endings, so the LF
+    # form is the fallback when the CRLF one doesn't match.
+    old_lf = old_string.replace("\r\n", "\n")
+    new_lf = new_string.replace("\r\n", "\n")
+    old_string, new_string = old_lf, new_lf
+    if "\r\n" in content:
+        old_crlf = old_lf.replace("\n", "\r\n")
+        if content.count(old_crlf) or not content.count(old_lf):
+            old_string, new_string = old_crlf, new_lf.replace("\n", "\r\n")
+
     count = content.count(old_string)
     if count == 0:
         # Common small-model failure: copying read_file's "   12  " line-number
         # column into old_string. Detect it and say so directly instead of the
         # generic mismatch message, since "match exactly" alone tends to make
         # the model retry the same mistake with more surrounding lines.
-        stripped = _strip_line_number_prefix(old_string)
-        if stripped is not None and content.count(stripped) > 0:
+        stripped = _strip_line_number_prefix(old_lf)
+        if stripped is not None and content.replace("\r\n", "\n").count(stripped) > 0:
             return ("[old_string not found - it still has read_file's line-number "
                     "prefix (e.g. '   12  '); that's display metadata, not file "
                     "content. Strip it from the start of each line and try again]")
@@ -348,12 +365,13 @@ def edit_file(path, old_string, new_string, replace_all=False):
     n           = count if replace_all else 1
     new_content = content.replace(old_string, new_string, -1 if replace_all else 1)
     plural      = "s" if n != 1 else ""
-    show_diff(content, new_content, path)
+    # Diffed as LF: difflib would otherwise show a stray \r on every line.
+    show_diff(content.replace("\r\n", "\n"), new_content.replace("\r\n", "\n"), path)
     ok, reason = confirm(f"edit {path} ({n} replacement{plural})?")
     if not ok:
         return declined("write", reason)
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(new_content)
     except OSError as e:
         return f"[error writing {path}: {e}]"
@@ -437,7 +455,14 @@ def run_cmd(cmd):
     combined, code = run_shell(cmd)
     if code is None:
         return f"[timed out after {config.CMD_TIMEOUT}s]"
-    return combined or f"[exit {code}, no output]"
+    if not combined:
+        return f"[exit {code}, no output]"
+    # A failure with output used to look exactly like a success: the code was
+    # only reported when there was nothing else to show. Report it whenever
+    # it is non-zero, at the end, where the shell puts it too and where test
+    # runners print their summary. A clean exit adds nothing — output with
+    # no exit line reads as success.
+    return combined if code == 0 else f"{combined}\n[exit {code}]"
 
 
 TOOLS = {

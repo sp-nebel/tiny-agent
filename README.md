@@ -83,9 +83,9 @@ While the model composes a tool call nothing streams — Ollama sends the call a
 | `find_files` | Glob-pattern file search |
 | `list_dir` | List directory contents |
 | `cd` | Change the working directory |
-| `edit_file` | Exact-string replacement edit, or create a new file (an empty existing file counts as new) |
+| `edit_file` | Exact-string replacement edit, or create a new file (an empty existing file counts as new); CRLF files keep their line endings, and bytes outside the replacement are never rewritten |
 | `append_file` | Append text to the end of a file (creating it if missing); inserts a separating newline if needed and keeps the file's line endings |
-| `run_cmd` | Run a shell command |
+| `run_cmd` | Run a shell command; a non-zero exit code is appended to the output as `[exit N]` |
 
 `edit_file`, `append_file` and `run_cmd` ask for confirmation before executing unless `--yes` is passed. Edits show a colored unified diff before the confirmation prompt (and under `--yes`, as a record of what changed). The prompt is `[y/N/reason]`: `y` approves, empty/`n` declines, and anything else declines *and* is passed back to the model as the reason — `use the test runner, not python directly` redirects it, where a bare refusal tends to make a small model re-issue the identical call.
 
@@ -129,6 +129,7 @@ Newest first. Every commit adds its entry here (see `CLAUDE.md`).
 
 ### 2026-09-18
 
+- **`edit_file` keeps CRLF line endings; `run_cmd` reports failures**: editing a Windows-style file no longer rewrites all its line endings to LF. Only the replaced text changes, even in files with mixed endings. A command that fails with output now ends with `[exit N]`; before, the exit code was only shown when there was no output, so a failing test run looked like a pass.
 - **`/undo` fixes** (`a7e94e8`): a multi-line prompt is printed on `/undo` instead of being put back into the single-line input buffer, where it garbled the display. Restore and remove messages now show only the path, and the README's cost note for rollbacks on SWA models now says the cost hasn't been measured.
 - **Multi-line prompts with a trailing `\`** (`1eeb6dc`): a line ending in `\` opens a `...` continuation prompt, and the lines are sent as one message. This works in the main prompt only; `interject` and `steer` stay single-line.
 - **`@path` attachments** (`1b84ee4`): any `@token` in a prompt that names an existing file attaches that file's contents to the message. They're rendered by `read_file`, so the model gets the same line cap and read-on instruction as its own reads.
