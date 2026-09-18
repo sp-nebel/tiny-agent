@@ -13,6 +13,7 @@ from rich.markdown import Markdown
 from rich.markup import escape
 
 import config
+import commands
 import checkpoint
 from tools import dispatch, read_file, run_shell, normalize_call, CommandInterrupted
 from ollama import call_ollama, warm_cache
@@ -814,6 +815,24 @@ FILE_REF_RE     = re.compile(r"(?<!\S)@(\S+)")
 # than belonging to it; stripped only when the token as typed isn't a file.
 FILE_REF_TRAIL  = ".,;:!?)]}'\""
 FILE_BLOCK_HEAD = "[contents of {path}, attached by the user]"
+# `@path#10-40` (or `#10`) attaches just those lines.
+FILE_RANGE_RE   = re.compile(r"#(\d+)(?:-(\d+))?$")
+
+
+def _resolve_file_ref(token):
+    """(path as typed, start, end) for an `@token` naming an existing file,
+    or None. Tried as typed first, then without trailing sentence
+    punctuation; each with an optional #A-B line range."""
+    for cand in (token, token.rstrip(FILE_REF_TRAIL)):
+        path, start, end = cand, 1, None
+        rng = FILE_RANGE_RE.search(cand)
+        if rng and not os.path.isfile(os.path.expanduser(cand)):
+            path  = cand[:rng.start()]
+            start = int(rng.group(1))
+            end   = int(rng.group(2) or rng.group(1))
+        if path and os.path.isfile(os.path.expanduser(path)):
+            return path, start, end
+    return None
 
 
 def expand_file_refs(text):
@@ -831,22 +850,24 @@ def expand_file_refs(text):
     blocks = []
     seen   = set()
     for m in FILE_REF_RE.finditer(text):
-        path = m.group(1)
-        if not os.path.isfile(os.path.expanduser(path)):
-            path = path.rstrip(FILE_REF_TRAIL)
-        full = os.path.expanduser(path)
-        if not path or not os.path.isfile(full) or full in seen:
+        ref = _resolve_file_ref(m.group(1))
+        if ref is None:
             continue
-        seen.add(full)
-        blocks.append(FILE_BLOCK_HEAD.format(path=path) + "\n" + read_file(full))
-        config.console.print(f"[dim]attached {escape(path)}[/dim]")
+        path, start, end = ref
+        full = os.path.expanduser(path)
+        if (full, start, end) in seen:
+            continue
+        seen.add((full, start, end))
+        shown = path if end is None else f"{path} lines {start}-{end}"
+        blocks.append(FILE_BLOCK_HEAD.format(path=shown) + "\n" + read_file(full, start, end))
+        config.console.print(f"[dim]attached {escape(shown)}[/dim]")
     return "\n\n".join([text] + blocks)
 
 # --------------------------------------------------------------------------- #
 # Undo
 # --------------------------------------------------------------------------- #
 
-def undo_last_turn(messages, turns):
+def undo_last_turn(messages, turns, announce=True):
     """Rewind the most recent turn: restore the files it changed from its
     git snapshot, cut its messages off the tail, and return its record (so
     main can put the prompt back in the input line and restore first_user_msg);
@@ -882,6 +903,8 @@ def undo_last_turn(messages, turns):
     del messages[rec["msg_index"]:]
     with contextlib.suppress(OSError):
         os.chdir(rec["cwd"])
+    if not announce:
+        return rec
     if "\n" in rec["prompt"]:
         # readline edits one line; a multi-line prompt inserted into it
         # garbles the display, so show it instead of pre-filling it.
@@ -933,10 +956,17 @@ def main():
             with contextlib.suppress(OSError):
                 readline.write_history_file(histfile)
         atexit.register(save_history)
+        commands.install_completer(
+            readline, lambda: list(commands.load_custom_commands(
+                _git_root(os.getcwd()) or os.getcwd())))
 
     messages       = [{"role": "system", "content": config.SYSTEM}]
     first_user_msg = True
     session_name   = None
+    # The conversation's first prompt, shown by /sessions in place of a bare
+    # timestamp. Not an LLM-written title: that would be an extra call, and
+    # with Ollama's single cache slot it would evict the conversation.
+    session_title  = ""
     # One record per turn, newest last, for /undo: where the turn's messages
     # start, its raw prompt, the cwd and first_user_msg it began with, and a
     # git snapshot of the working tree (None outside a repo). Indices into
@@ -957,8 +987,14 @@ def main():
         # don't litter the session store.
         if len(messages) > 1:
             with contextlib.suppress(OSError):
-                save_session(session_name or default_ts_name(), messages)
+                save_session(session_name or default_ts_name(), messages, session_title)
     atexit.register(autosave)
+
+    def project_root():
+        return _git_root(os.getcwd()) or os.getcwd()
+
+    def custom_commands():
+        return commands.load_custom_commands(project_root())
 
     if args.resume is not None:
         path = resolve_session(args.resume)
@@ -971,6 +1007,7 @@ def main():
                 # strip_nudges ran) can carry a stray nudge; drop it on restore.
                 messages[:] = [m for m in messages if not _is_stray_nudge(m)]
                 session_name   = name
+                session_title  = data.get("title", "")
                 first_user_msg = False
                 config.console.print(f"[dim]resumed session '{escape(name)}' ({len(messages)} messages)[/dim]")
             except (OSError, ValueError, KeyError, TypeError):
@@ -996,11 +1033,8 @@ def main():
         "streams, just start typing to queue a message for the model; Tab "
         "stops the reply now so you can steer it; Esc cancels the reply. "
         "'!cmd' runs a shell command and sends its output with your next "
-        "message ('!!cmd': shown only to you), '@path' attaches a file, a "
-        "trailing '\\' continues the line. '/undo' takes back the last turn "
-        "(files too, in a git repo), '/clear' to reset context, '/save', '/resume', "
-        "'/sessions' to pause/switch conversations (each takes an optional "
-        "name), 'exit' to quit.[/dim]\n"
+        "message, '@path' attaches a file, '/undo' takes back the last turn, "
+        "'/help' lists every command, 'exit' quits.[/dim]\n"
     )
 
     while True:
@@ -1016,105 +1050,181 @@ def main():
                 config.console.print("\nbye")
                 return
 
-        if user.lower() in ("exit", "quit"):
-            return
-        if user.startswith("!"):
-            local = user.startswith("!!")
-            cmd   = user[2 if local else 1:].strip()
-            if cmd:
-                block = run_shell_escape(cmd)
-                if not local:
-                    pending_shell.append(block)
-                    config.console.print("[dim]output goes to the model with your next message[/dim]")
-            config.console.print()
-            continue
-        if user.lower() in ("/clear", "clear"):
-            # Drop all conversation history but keep messages[0] (the static
-            # system prompt). The system prompt + tool schemas are the cached
-            # prefix, so this frees the context window without paying to
-            # prefill them again. Resetting first_user_msg re-injects the cwd
-            # context into the next first user message.
-            del messages[1:]
-            del turns[:]
-            del pending_shell[:]
-            first_user_msg = True
-            config.console.print("[dim]context cleared (system prompt preserved)[/dim]\n")
-            continue
-        if user.lower() in ("/details", "/thinking"):
-            # Display only: what the model is sent (and the `think` flag,
-            # which would change the prompt template) stays as it was.
-            attr = "SHOW_DETAILS" if user.lower() == "/details" else "SHOW_THINKING"
-            setattr(config, attr, not getattr(config, attr))
-            what = ("full tool results" if attr == "SHOW_DETAILS"
-                    else "the model's reasoning while it streams")
-            config.console.print(f"[dim]{'showing' if getattr(config, attr) else 'hiding'} "
-                                 f"{what}[/dim]\n")
-            continue
-        if user.lower() == "/sessions":
-            files = list_sessions()
-            if not files:
-                config.console.print("[dim]no saved sessions[/dim]\n")
+        # The raw text of the prompt as typed, for /undo and the session
+        # title; differs from `user` when a custom command expanded it.
+        raw_prompt = user
+        # Text written in /editor is a prompt, whatever it starts with: a
+        # first line of "!rm …" or "/save x" must not run as a command.
+        literal = False
+        if user.lower() == "/editor":
+            text = commands.edit_in_editor()
+            if text is None or not text.strip():
+                if text is not None:
+                    config.console.print("[dim]empty prompt; nothing sent[/dim]\n")
                 continue
-            for f in files:
-                name = os.path.splitext(os.path.basename(f))[0]
-                try:
-                    with open(f, "r", encoding="utf-8") as fh:
-                        meta = json.load(fh)
-                except (OSError, ValueError):
+            user = raw_prompt = text.strip()
+            literal = True
+            config.console.print(f"[bold green]you[/bold green] {escape(user)}")
+
+        if not literal:
+            if user.lower() in ("exit", "quit"):
+                return
+            if user.startswith("!"):
+                local = user.startswith("!!")
+                cmd   = user[2 if local else 1:].strip()
+                if cmd:
+                    block = run_shell_escape(cmd)
+                    if not local:
+                        pending_shell.append(block)
+                        config.console.print("[dim]output goes to the model with your next message[/dim]")
+                config.console.print()
+                continue
+            if user.lower() in ("/clear", "clear"):
+                # Drop all conversation history but keep messages[0] (the static
+                # system prompt). The system prompt + tool schemas are the cached
+                # prefix, so this frees the context window without paying to
+                # prefill them again. Resetting first_user_msg re-injects the cwd
+                # context into the next first user message.
+                del messages[1:]
+                del turns[:]
+                del pending_shell[:]
+                first_user_msg = True
+                session_title  = ""
+                config.console.print("[dim]context cleared (system prompt preserved)[/dim]\n")
+                continue
+            if user.lower() in ("/details", "/thinking"):
+                # Display only: what the model is sent (and the `think` flag,
+                # which would change the prompt template) stays as it was.
+                attr = "SHOW_DETAILS" if user.lower() == "/details" else "SHOW_THINKING"
+                setattr(config, attr, not getattr(config, attr))
+                what = ("full tool results" if attr == "SHOW_DETAILS"
+                        else "the model's reasoning while it streams")
+                config.console.print(f"[dim]{'showing' if getattr(config, attr) else 'hiding'} "
+                                     f"{what}[/dim]\n")
+                continue
+            if user.lower() == "/sessions":
+                files = list_sessions()
+                if not files:
+                    config.console.print("[dim]no saved sessions[/dim]\n")
                     continue
-                marker = " [bold]*[/bold]" if name == session_name else ""
-                n        = len(meta.get("messages", []))
-                saved_at = meta.get("saved_at", "?")
-                config.console.print(f"[dim]{escape(name)}{marker} — {escape(str(saved_at))} · {n} messages[/dim]")
-            config.console.print()
-            continue
-        if user.lower() == "/save" or user.lower().startswith("/save "):
-            arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
-            name = arg_name or session_name or default_ts_name()
-            save_session(name, messages)
-            session_name = name
-            config.console.print(f"[dim]saved session '{escape(name)}'[/dim]\n")
-            continue
-        if user.lower() == "/resume" or user.lower().startswith("/resume "):
-            arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
-            path = resolve_session(arg_name)
-            if not path:
-                config.console.print("[yellow]no matching session; conversation unchanged[/yellow]\n")
+                for f in files:
+                    name = os.path.splitext(os.path.basename(f))[0]
+                    try:
+                        with open(f, "r", encoding="utf-8") as fh:
+                            meta = json.load(fh)
+                    except (OSError, ValueError):
+                        continue
+                    marker = " [bold]*[/bold]" if name == session_name else ""
+                    n        = len(meta.get("messages", []))
+                    saved_at = meta.get("saved_at", "?")
+                    title    = meta.get("title") or ""
+                    title    = f" — {title}" if title else ""
+                    config.console.print(f"[dim]{escape(name)}{marker}{escape(title)} · "
+                                         f"{escape(str(saved_at))} · {n} messages[/dim]")
+                config.console.print()
                 continue
-            new_name = os.path.splitext(os.path.basename(path))[0]
-            # Switching away from a named, non-empty session shouldn't lose it.
-            if session_name and len(messages) > 1:
-                with contextlib.suppress(OSError):
-                    save_session(session_name, messages)
-            try:
-                data = load_session(new_name)
-                apply_session(messages, data, args.model)
-                messages[:] = [m for m in messages if not _is_stray_nudge(m)]
-            except (OSError, ValueError, KeyError, TypeError):
-                config.console.print("[yellow]could not read session; conversation unchanged[/yellow]\n")
+            if user.lower() == "/save" or user.lower().startswith("/save "):
+                arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
+                name = arg_name or session_name or default_ts_name()
+                save_session(name, messages, session_title)
+                session_name = name
+                config.console.print(f"[dim]saved session '{escape(name)}'[/dim]\n")
                 continue
-            session_name   = new_name
-            first_user_msg = False
-            del turns[:]
-            del pending_shell[:]
-            config.console.print(f"[dim]resumed session '{escape(new_name)}' ({len(messages)} messages)[/dim]\n")
-            threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
-            continue
-        if user.lower() == "/undo":
-            rec = undo_last_turn(messages, turns)
-            if rec:
-                first_user_msg = rec["first"]
-                seed           = "" if "\n" in rec["prompt"] else rec["prompt"]
+            if user.lower() == "/resume" or user.lower().startswith("/resume "):
+                arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
+                path = resolve_session(arg_name)
+                if not path:
+                    config.console.print("[yellow]no matching session; conversation unchanged[/yellow]\n")
+                    continue
+                new_name = os.path.splitext(os.path.basename(path))[0]
+                # Switching away from a named, non-empty session shouldn't lose it.
+                if session_name and len(messages) > 1:
+                    with contextlib.suppress(OSError):
+                        save_session(session_name, messages, session_title)
+                try:
+                    data = load_session(new_name)
+                    apply_session(messages, data, args.model)
+                    messages[:] = [m for m in messages if not _is_stray_nudge(m)]
+                except (OSError, ValueError, KeyError, TypeError):
+                    config.console.print("[yellow]could not read session; conversation unchanged[/yellow]\n")
+                    continue
+                session_name   = new_name
+                session_title  = data.get("title", "")
+                first_user_msg = False
+                del turns[:]
+                del pending_shell[:]
+                config.console.print(f"[dim]resumed session '{escape(new_name)}' ({len(messages)} messages)[/dim]\n")
                 threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
-            continue
+                continue
+            if user.lower() == "/undo" or re.fullmatch(r"/undo\s+\d+", user.lower()):
+                n   = max(1, int(user.split()[1])) if " " in user else 1
+                rec = None
+                # One turn at a time, newest first, so each restore lands on the
+                # snapshot the next-older turn started from.
+                for i in range(n):
+                    if not turns:
+                        break
+                    rec = undo_last_turn(messages, turns, announce=(i == n - 1 or len(turns) == 1))
+                if rec is None:
+                    undo_last_turn(messages, turns)      # prints "nothing to undo"
+                else:
+                    first_user_msg = rec["first"]
+                    seed           = "" if "\n" in rec["prompt"] else rec["prompt"]
+                    if first_user_msg:
+                        session_title = ""
+                    threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
+                continue
+            if user.lower() == "/history":
+                if not turns:
+                    config.console.print("[dim]no turns to list yet (a resumed or cleared "
+                                         "conversation starts a new list)[/dim]\n")
+                    continue
+                for i, rec in enumerate(turns, start=1):
+                    first = rec["prompt"].split("\n", 1)[0]
+                    more  = " …" if "\n" in rec["prompt"] or len(first) > 70 else ""
+                    config.console.print(f"[dim]{i:3}  {escape(first[:70])}{more}[/dim]")
+                config.console.print(f"[dim]/undo N takes back the last N of these "
+                                     f"({len(turns)} in all)[/dim]\n")
+                continue
+            if user.lower() == "/export" or user.lower().startswith("/export "):
+                target = user.split(maxsplit=1)[1].strip() if " " in user else ""
+                target = os.path.expanduser(target or f"tiny-agent-{session_name or default_ts_name()}.md")
+                try:
+                    with open(target, "w", encoding="utf-8") as f:
+                        f.write(commands.export_markdown(messages, session_title))
+                    config.console.print(f"[dim]wrote {escape(target)}[/dim]\n")
+                except OSError as e:
+                    config.console.print(f"[red]could not write {escape(target)}: {escape(str(e))}[/red]\n")
+                continue
+            if user.lower() == "/help":
+                commands.print_help(custom_commands())
+                continue
+            if user.startswith("/"):
+                name, _, argstr = user.partition(" ")
+                custom = custom_commands()
+                if name.lower() in custom:
+                    raw_prompt = user
+                    user = commands.expand_custom_command(custom[name.lower()][2],
+                                                          argstr.strip(), run_shell)
+                    config.console.print(f"[dim]{escape(name.lower())} → "
+                                         f"{len(user)} chars[/dim]")
+                elif re.fullmatch(r"/[A-Za-z][\w-]*", name) and not os.path.exists(name):
+                    # Almost certainly a mistyped command, not a question about
+                    # the path /word: don't spend a turn sending it to the model.
+                    config.console.print(f"[yellow]unknown command {escape(name)}; "
+                                         f"/help lists them[/yellow]\n")
+                    seed = "" if "\n" in user else user
+                    continue
         if not user:
             continue
 
         # Snapshot before the turn can touch anything. Stat-cached (see
         # checkpoint._write_tree), so on an unchanged tree it costs a few git
         # calls, not a re-hash of the repo.
-        turns.append({"msg_index": len(messages), "prompt": user, "first": first_user_msg,
+        turns.append({"msg_index": len(messages), "prompt": raw_prompt, "first": first_user_msg,
                       "cwd": os.getcwd(), "snap": checkpoint.snapshot()})
+        if first_user_msg:
+            session_title = raw_prompt.split("\n", 1)[0][:80]
 
         # cwd and instructions injected into the FIRST user message only —
         # keeps the system prompt byte-identical across projects so the

@@ -12,7 +12,7 @@ behavior warrants it → doc sync. Do the first three always; they need nothing 
 ## 1. Static pass (always)
 
 ```bash
-python3 -m py_compile local_agent.py agent.py config.py ollama.py tools.py session.py checkpoint.py ui.py
+python3 -m py_compile local_agent.py agent.py config.py ollama.py tools.py session.py checkpoint.py ui.py commands.py
 ```
 
 Silence means success. Also confirm nothing imported a new third-party package — the
@@ -139,6 +139,12 @@ Run `python3 local_agent.py` and exercise:
   --cached` look exactly as before the turn. Outside a repo it warns and rewinds only the
   conversation.
 - A multi-line paste arrives as one prompt, not one prompt per line.
+- `/help` lists built-ins and any `.tiny-agent/commands/*.md`; `/NAME args` sends the filled-in
+  template; a mistyped `/word` comes back in the input line instead of going to the model.
+- Tab at the prompt completes `@pa…` to a path and `/he…` to `/help`.
+- `/editor` opens `$EDITOR`; the saved text is sent as a prompt even if it starts with `!`.
+- `/history` then `/undo 2` rewinds two turns (files too, in a git repo).
+- `/export` writes a readable Markdown transcript; `/sessions` shows first-prompt titles.
 - Ask for a long file edit: while the tool call is composed silently, the live region shows
   `generating… Ns without visible output` after ~2s and Esc still cancels. The next prompt
   must answer promptly — if it hangs for minutes, the abandoned generation wasn't torn down

@@ -18,10 +18,11 @@ def session_path(name):
     return os.path.join(config.SESSION_DIR, os.path.basename(name) + ".json")
 
 
-def save_session(name, messages):
+def save_session(name, messages, title=""):
     os.makedirs(config.SESSION_DIR, exist_ok=True)
     data = {
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "title":    title,
         "model":    config.MODEL,
         "cwd":      os.getcwd(),
         "messages": messages,

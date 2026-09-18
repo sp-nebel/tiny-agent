@@ -49,6 +49,9 @@ read `verifying-tiny-agent`.
 - `session.py` — save/resume persistence (`~/.tiny_agent_sessions/`). `apply_session` mutates
   the `messages` list in place (`messages[:] = ...`) so the autosave closure keeps seeing it —
   never rebind that list.
+- `commands.py` — REPL helpers that don't touch the model: custom `/commands` loaded from
+  `.tiny-agent/commands/` and `~/.config/tiny-agent/commands/`, `/help` text, `/export`
+  Markdown, `/editor`, and readline Tab completion. main() dispatches to them.
 - `ui.py` — terminal helpers: cbreak/cancel-key handling, bracketed paste, live stream
   rendering, stats formatting.
 

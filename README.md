@@ -59,21 +59,44 @@ python local_agent.py
 | Input | Effect |
 |-------|--------|
 | `exit` / `quit` | Quit the agent |
+| `/help` | List the built-in commands and your custom commands |
 | `/clear` or `clear` | Reset conversation history (system prompt and tool schemas stay cached) |
 | `/save [NAME]` | Save the current conversation as a session (defaults to a timestamp) |
 | `/resume [NAME]` | Resume a saved session; bare `/resume` resumes the most recent |
-| `/sessions` | List saved sessions |
+| `/sessions` | List saved sessions, each with its first prompt as a title |
+| `/history` | List this conversation's turns, numbered oldest first, as far back as `/undo N` can reach (the list starts over after `/clear` and `/resume`) |
+| `/export [PATH]` | Write the conversation to a Markdown file: prompts, answers, and each tool call with its result (default `tiny-agent-<session>.md` in the working directory) |
+| `/editor` | Write the next prompt in `$VISUAL` or `$EDITOR` (default `vi`). What you save is sent as a prompt, even if it starts with `!` or `/` |
+| `/NAME [ARGS]` | Run a custom command (see below). An unknown `/word` is not sent to the model; it goes back into the input line |
 | `/details` | Toggle full tool results under each call. Off by default: each call is one line (`→ read agent.py:10-40 (10-40 of 543)`, `→ grep "foo" (7 matches)`, `→ run_cmd pytest` then `exit 0`), and a result's body is shown only when the call failed |
 | `/thinking` | Toggle the live view of the model's reasoning while it streams. Display only: the model still thinks, and the request is unchanged |
 | `!cmd` | Run a shell command yourself; its output (and exit code) is shown and goes to the model ahead of your next message. It runs in a subshell, so `!cd` has no lasting effect |
 | `!!cmd` | Same, but the output is only shown to you, never sent to the model |
 | Line ending in `\` | Continue the prompt on the next line (a dim `...` prompt); the lines are sent as one message. A multi-line paste needs no backslashes — it already arrives as one message |
-| `@path` in a prompt | Attach that file: its contents go to the model with the message, exactly as the model's own first `read_file` of it would return them (numbered lines, first 100, with the usual instruction for reading on). Only tokens that name an existing file count, so `me@example.com` and `@alice` stay plain text; trailing sentence punctuation is ignored. Paths with spaces aren't supported |
-| `/undo` | Take back the last turn: its messages are cut from the conversation, the files it changed are restored from a git snapshot taken when it started, and its prompt is put back in the input line to edit and resend. Repeat to walk further back. Outside a git repo only the conversation is rewound. `!cmd` output that rode along with the undone prompt is not queued again, and a multi-line prompt is printed rather than pre-filled |
+| `@path` or `@path#A-B` in a prompt | Attach that file, or only its lines A to B (`@agent.py#10-40`, `@agent.py#12`): its contents go to the model with the message, exactly as the model's own first `read_file` of it would return them (numbered lines, first 100, with the usual instruction for reading on). Only tokens that name an existing file count, so `me@example.com` and `@alice` stay plain text; trailing sentence punctuation is ignored. Paths with spaces aren't supported |
+| `/undo [N]` | Take back the last turn (or the last N): its messages are cut from the conversation, the files it changed are restored from a git snapshot taken when it started, and its prompt is put back in the input line to edit and resend. Repeat to walk further back, or give a count: `/undo 3` takes back the last three turns and puts the oldest one's prompt back. Outside a git repo only the conversation is rewound. `!cmd` output that rode along with the undone prompt is not queued again, and a multi-line prompt is printed rather than pre-filled |
 | Any other key during a reply | Pauses the stream and opens an `interject` prompt for a message to the model; the key you typed becomes the first character of the line. Delivered at the next step boundary (after the current tool round-trip finishes), or as the next prompt if the turn ends first. Submit an empty line to think better of it |
 | Tab during a reply | Stop the reply now and steer it: the text and reasoning so far stay in context, any tool call it had started is dropped unrun, and a `steer` prompt asks for a note the model must follow before continuing (empty = "stop and reconsider"). Costs no step. Inside the `interject` prompt Tab is ordinary line-editing completion, not a stop |
 | Esc during a reply | Cancel the in-flight response |
 | Up / Down arrows | Recall previous prompts (history persists in `~/.tiny_agent_history`) |
+| Tab at the prompt | Complete an `@path` or a `/command` |
+
+### Custom commands
+
+A Markdown file in `.tiny-agent/commands/` (at the git root, or the working directory outside a repo) or `~/.config/tiny-agent/commands/` becomes a command named after the file: `review.md` is `/review`. When both define the same name, the project's file wins, and neither can replace a built-in command. Typing the command sends the file's text as your prompt, filled in first:
+
+- `$ARGUMENTS` becomes everything after the command name, and `$1` … `$9` the individual words. If the file uses neither, what you typed after the name is added at the end.
+- `` !`cmd` `` is replaced by that shell command's output. It runs without asking, like `!cmd` at the prompt, and each one is printed as it runs.
+- `@path` attaches a file, as in a typed prompt.
+
+An optional front-matter block sets the description `/help` shows:
+
+```markdown
+---
+description: review a file for bugs
+---
+Review @$1 for bugs, especially $2. Current branch: !`git branch --show-current`
+```
 
 Esc is the only key that cancels, and only on its own: arrow keys and other escape sequences are drained rather than read as a cancel. Once a reply has started streaming, keys are polled every quarter second whether or not anything arrives. Before that — during the silent re-prefill after a trim pass, when Ollama hasn't sent even the response headers yet — nothing is seen until generation starts. A multi-line paste into a stream arrives as one interjection per line.
 
@@ -140,7 +163,8 @@ Newest first. Every commit adds its entry here (see `CLAUDE.md`).
 
 ### 2026-09-18
 
-- **`a` = always allow at the confirmation prompt**: the prompt is now `[y/N/a/reason]`. `a` on an edit allows all edits for the rest of the session. On a command, it allows commands with the same prefix (`git checkout …`, `npm run dev …`, `pytest …`). Commands that chain, pipe, redirect or substitute always ask.
+- **Custom commands, `/help`, `/history`, `/undo N`, `/export`, `/editor`, line ranges, Tab completion, session titles**: Markdown files in `.tiny-agent/commands/` or `~/.config/tiny-agent/commands/` become `/name` commands, with `$ARGUMENTS`, `$1`…`$9`, `` !`cmd` `` and `@file` filled in; `/help` lists them with the built-ins. `/history` numbers the conversation's turns, and `/undo N` takes back several at once. `/export` writes the conversation to Markdown, and `/editor` composes a prompt in `$EDITOR`. `@path#10-40` attaches just those lines, and Tab completes `@paths` and `/commands`. `/sessions` shows each session's first prompt as its title. A mistyped `/command` is no longer sent to the model as a prompt.
+- **`a` = always allow at the confirmation prompt** (`60c4efc`): the prompt is now `[y/N/a/reason]`. `a` on an edit allows all edits for the rest of the session. On a command, it allows commands with the same prefix (`git checkout …`, `npm run dev …`, `pytest …`). Commands that chain, pipe, redirect or substitute always ask.
 - **Quieter tool display, `/details`, `/thinking`, richer stats, notifications** (`19648c6`): each tool call now prints one line with its outcome (`→ grep "foo" (7 matches)`), and a result's body appears only when the call failed or `/details` is on. `/thinking` hides the live reasoning view without changing the request. The stats line adds the turn's total time and the share of the context window in use, and the live region counts queued messages. A turn that ran 20s or more rings the bell and sends a desktop notification when it ends or waits for a confirmation (`AGENT_NOTIFY=0` turns this off).
 - **Retry with backoff** (`67adeff`): a request to Ollama that fails before anything streams (connection refused or reset, HTTP 429/500/502/503/504) is retried up to 5 times with exponential backoff (2s doubling to 30s, with jitter), instead of a single retry on a refused connection. A context overflow and any 4xx are never retried.
 - **`AGENTS.md` / `CLAUDE.md` instructions** (`f88b792`): the first message of a conversation now carries `~/.config/tiny-agent/AGENTS.md` and the nearest project `AGENTS.md` or `CLAUDE.md` (walking up to the git root), each cut at 3000 chars. The environment line also says whether the directory is a git repo, the platform, and the date. The system prompt is unchanged, so the cached prefix is unaffected.
