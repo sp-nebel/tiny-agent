@@ -21,7 +21,9 @@ state its cache impact.** If you can't state it, you don't understand the change
    projects. Never interpolate anything dynamic into them (no cwd, no date, no per-project
    text). Dynamic context goes in **user messages** — the cwd goes in the *first* user message
    only (see `main()` in agent.py). Editing SYSTEM/TOOL_SCHEMAS in a commit is fine (users pay
-   one re-prefill after upgrading); making them *vary at runtime* is not.
+   one re-prefill after upgrading); making them *vary at runtime* is not. Adding a tool is
+   the same trade: `append_file`'s schema grew the static prefix by ~120 tokens, paid once per
+   process or resumed session, never per turn — so a tool is always on, never toggled.
 
 2. **Appending at the tail is free; editing committed history busts the cache** from the edit
    point on. This is why:

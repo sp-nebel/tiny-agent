@@ -240,7 +240,8 @@ TOOL_SCHEMAS = [
                 "column (e.g. '   12  ') in old_string - that is display metadata, "
                 "not file content, and including it will make the match fail. "
                 "To CREATE a new file, pass an empty old_string and the full "
-                "contents in new_string. Prefer a small, uniquely-identifying "
+                "contents in new_string in one call. To add text at the END of a "
+                "file use append_file instead. Prefer a small, uniquely-identifying "
                 "old_string over a large one. Will ask the user for confirmation."
             ),
             "parameters": {
@@ -252,6 +253,26 @@ TOOL_SCHEMAS = [
                     "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring a unique match (default false)"},
                 },
                 "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_file",
+            "description": (
+                "Append text to the end of a file, creating the file if it does "
+                "not exist. "
+                "A newline is inserted first if the file does not already end "
+                "with one. Will ask the user for confirmation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "text": {"type": "string", "description": "Text to append, exactly as it should appear in the file"},
+                },
+                "required": ["path", "text"],
             },
         },
     },

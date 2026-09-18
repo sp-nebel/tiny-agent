@@ -24,7 +24,7 @@ harder when told only "that was wrong". Write for that audience.
 - Metadata inside a result is always **bracketed** — `[lines 1-100 of 543 - file continues]`,
   `[+12 more matches]` — and `config.SYSTEM` tells the model bracketed lines are tool
   metadata, not file content. Keep both sides of that convention in sync.
-- Destructive tools (`edit_file`, `run_cmd`) gate on `confirm()`, which honors
+- Destructive tools (`edit_file`, `append_file`, `run_cmd`) gate on `confirm()`, which honors
   `config.AUTO_YES` (`--yes`). Edits call `show_diff` *even under `--yes`* — it's the only
   record of what the agent changed. A new destructive tool must do both.
 

@@ -360,6 +360,60 @@ def edit_file(path, old_string, new_string, replace_all=False):
     return f"[edited {path}: {n} replacement{plural}]"
 
 
+def append_file(path, text):
+    """Append to a file, creating it if missing.
+
+    Exists because the toolset otherwise has no legal way to add text to a
+    file: appending via edit_file needs the file's exact last line as an
+    anchor, which small models rarely manage, so they detour through run_cmd
+    (echo, heredocs, python -c) and hit shell quoting and command-line
+    limits. Appending also never re-emits existing content: generated tokens
+    are the slow ones (prefill is batched, generation is one at a time), so
+    rewriting a file to add a paragraph costs the whole file in generation.
+
+    Rewrites the whole file rather than opening in append mode so the diff
+    shows context and the file's existing line ending is preserved. A
+    separating newline is inserted when the file doesn't end with one, so
+    the appended text always starts on its own line.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        raw = None
+    except UnicodeDecodeError:
+        return f"[binary file, cannot append: {path}]"
+    except OSError as e:
+        return f"[error reading {path}: {e}]"
+
+    eol         = "\r\n" if raw and "\r\n" in raw else "\n"
+    existing    = (raw or "").replace("\r\n", "\n")
+    addition    = text if (not existing or existing.endswith("\n")) else "\n" + text
+    new_content = existing + addition
+
+    show_diff(existing, new_content, path)
+    if raw is None:
+        ok, reason = confirm(f"create {path} ({len(text)} chars)?")
+    else:
+        ok, reason = confirm(f"append {len(text)} chars to {path}?")
+    if not ok:
+        return declined("write", reason)
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline=eol) as f:
+            f.write(new_content)
+    except OSError as e:
+        return f"[error writing {path}: {e}]"
+    if raw is None:
+        return f"[created {path}, {len(text)} chars]"
+    # The line count lets the model aim a follow-up read_file at the new
+    # tail without first reading the whole file to find it.
+    return (f"[appended {len(text)} chars to {path}; it now has "
+            f"{len(new_content.splitlines())} lines]")
+
+
 def run_cmd(cmd):
     ok, reason = confirm(f"run: {cmd}")
     if not ok:
@@ -378,13 +432,14 @@ def run_cmd(cmd):
 
 
 TOOLS = {
-    "read_file":  read_file,
-    "grep":       grep,
-    "find_files": find_files,
-    "list_dir":   list_dir,
-    "cd":         cd,
-    "edit_file":  edit_file,
-    "run_cmd":    run_cmd,
+    "read_file":   read_file,
+    "grep":        grep,
+    "find_files":  find_files,
+    "list_dir":    list_dir,
+    "cd":          cd,
+    "edit_file":   edit_file,
+    "append_file": append_file,
+    "run_cmd":     run_cmd,
 }
 
 
