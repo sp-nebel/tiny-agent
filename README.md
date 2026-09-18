@@ -125,14 +125,12 @@ For typing, any keypress other than Esc or Tab opens a prompt for a message to t
 
 ## Changelog
 
-The last 15 commits (`c6efa18`…`8110c11`), newest first, plus work that is still uncommitted.
-
-### In progress (uncommitted)
-
-- **Shared shell runner for a `!cmd` prompt escape.** `run_cmd`'s execution path has been split out into `_run_shell`, which returns the capped output and exit code (or `None` on timeout). This lets `run_cmd` and a planned `!cmd` prompt escape share the same output cap and timeout. `run_cmd`'s results to the model are unchanged. The `!cmd` input itself hasn't landed yet.
+Newest first. Every commit adds its entry here (see `CLAUDE.md`).
 
 ### 2026-09-18
 
+- **`@path` attachments** (`1b84ee4`): any `@token` in a prompt that names an existing file attaches that file's contents to the message. They're rendered by `read_file`, so the model gets the same line cap and read-on instruction as its own reads.
+- **`!cmd` and `!!cmd` prompt escapes** (`392971c`): `!cmd` runs a shell command from the prompt, and its output goes to the model along with your next message. `!!cmd` only shows the output to you. `run_cmd`'s execution moved into a shared `_run_shell`, so both use one output cap and timeout.
 - **`/undo`** (`8110c11`): takes back the last turn. Files are restored from a git working-tree snapshot taken before the turn, through a temporary index. Files the turn created are removed, and the turn is cut off the history. Its prompt goes back into the input line. Your real index, HEAD and stash are never touched. Outside a git repo only the conversation is rewound. New module `checkpoint.py` with tests.
 - **Test suite** (`3a3ef62`, `5da78dd`): a pytest suite under `tests/` (86 tests at the time; 95 with the `/undo` tests) covering `run_turn` over a scripted fake model (interjections, Tab steering, the loop check), `append_file`, `confirm`, `edit_file`, `find_files`, `read_file`, output capping and history trimming. Six stale trim tests were fixed on the way. The project skills now document how to run and extend the suite.
 - **Loop check, `--check-every N`** (`bbd4eeb`): every N tool round-trips (default 20, `0` = never), the model is asked on a copy of the history whether it is going in circles. `STUCK` ends the turn on its explanation; `CONTINUE` leaves no trace. It does nothing under the default `--max-steps 20`. Use it with a higher cap or `--max-steps 0`.
