@@ -2,7 +2,9 @@ import os
 import re
 import glob
 import shutil
+import signal
 import difflib
+import contextlib
 import subprocess
 
 from rich.text import Text
@@ -195,13 +197,49 @@ def read_file(path, start=1, end=None):
     return body or "[empty file]"
 
 
-def grep(pattern, path=".", context=0, before=0, after=0):
+def _grep_records(raw):
+    """Parse `--null` grep/rg output into match groups.
+
+    Each line is "path\\0N:text" (a match) or "path\\0N-text" (context); a
+    bare "--" separates non-adjacent groups. The NUL is what makes this
+    parseable at all: with plain "path:N:text" a path or a context line
+    containing ':' or '-' is ambiguous. Returns a list of groups, each a list
+    of (path, lineno, is_match, text).
+    """
+    groups, cur = [], []
+    for line in raw.split("\n"):
+        if line == "--":
+            if cur:
+                groups.append(cur)
+            cur = []
+            continue
+        path, sep, rest = line.partition("\0")
+        if not sep:
+            continue
+        m = re.match(r"(\d+)([:-])", rest)
+        if not m:
+            continue
+        cur.append((path, int(m.group(1)), m.group(2) == ":", rest[m.end():]))
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def grep(pattern, path=".", context=0, before=0, after=0, include=None):
     # Base command differs (rg vs grep), but every flag below is accepted
-    # identically by both, so the model sees one consistent interface.
+    # identically by both, so the model sees one consistent interface. -H
+    # and --null make the output shape the same too, whatever `path` is.
     if shutil.which("rg"):
-        cmd = ["rg", "-n", "--no-heading"]   # respects .gitignore by default
+        cmd = ["rg", "-n", "-H", "--null", "--no-heading"]   # respects .gitignore
+        if include:
+            cmd += ["-g", include]
     else:
-        cmd = ["grep", "-rn"] + [f"--exclude-dir={d}" for d in sorted(config.SKIP_DIRS)]
+        # -E: rg's regex dialect is extended; basic mode would read "a|b"
+        # or "(x)" literally under grep and as a regex under rg.
+        cmd = (["grep", "-rnHIZE"]
+               + [f"--exclude-dir={d}" for d in sorted(config.SKIP_DIRS)])
+        if include:
+            cmd += [f"--include={include}"]
     if context:
         cmd += ["-C", str(int(context))]
     else:
@@ -211,28 +249,53 @@ def grep(pattern, path=".", context=0, before=0, after=0):
             cmd += ["-A", str(int(after))]
     cmd += ["--", pattern, path]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=config.CMD_TIMEOUT)
+        out = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                             timeout=config.CMD_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return "[grep timed out]"
+        return "[grep timed out; narrow the path or the pattern]"
     # rg and grep agree: exit 0 = matches, 1 = no matches, ≥2 = real error
     # (bad regex, unreadable path). Don't let an error message pass as hits.
-    if out.returncode > 1:
+    # GNU grep also exits 2 when *some* files were unreadable; keep its hits.
+    if out.returncode > 1 and not out.stdout.strip():
         return f"[grep error: {out.stderr.strip() or f'exit {out.returncode}'}]"
-    res = out.stdout.strip()
-    # With -A/-B/-C, rg and grep separate non-adjacent match groups with a
-    # standalone "--" line, so counting raw lines against MAX_GREP_HITS caps
-    # on far fewer real matches than the number implies (a context=3 hit is
-    # 7 lines). Cap by match group instead when context is in play.
-    if context or before or after:
-        blocks = res.split("\n--\n") if res else []
-        if len(blocks) > config.MAX_GREP_HITS:
-            blocks = blocks[:config.MAX_GREP_HITS] + [f"[+{len(blocks) - config.MAX_GREP_HITS} more matches]"]
-        res = "\n--\n".join(blocks)
-    else:
-        hits = res.splitlines()
-        if len(hits) > config.MAX_GREP_HITS:
-            res = "\n".join(hits[:config.MAX_GREP_HITS]) + f"\n[+{len(hits) - config.MAX_GREP_HITS} more matches]"
-    return _cap_output(res) or "[no matches]"
+
+    # Cap on real matches, keeping whole groups: with context a hit is
+    # several lines, so a raw line count caps on far fewer matches than
+    # MAX_GREP_HITS implies. Always keep the first group, however big.
+    ctx    = bool(context or before or after)
+    groups = _grep_records(out.stdout)
+    if not ctx:
+        # Adjacent hits come back as one run with no "--" between them;
+        # without context every hit stands alone.
+        groups = [[r] for g in groups for r in g]
+    kept, shown, total = [], 0, 0
+    for g in groups:
+        n = sum(1 for r in g if r[2])
+        total += n
+        if not kept or shown + n <= config.MAX_GREP_HITS:
+            kept.append(g)
+            shown += n
+
+    # Grouped by file, each path printed once: repeating a long path on
+    # every hit spent most of the result on it. Lines are cut at
+    # GREP_MAX_LINE_CHARS so one minified line can't use up the whole cap.
+    lines, cur_path = [], None
+    for gi, g in enumerate(kept):
+        if ctx and gi and g[0][0] == cur_path:
+            lines.append("--")
+        for p, n, is_match, text in g:
+            if p != cur_path:
+                if lines:
+                    lines.append("")
+                lines.append(p)
+                cur_path = p
+            if len(text) > config.GREP_MAX_LINE_CHARS:
+                text = text[:config.GREP_MAX_LINE_CHARS] + " [line cut]"
+            lines.append(f"{n}{':' if is_match else '-'}{text}")
+    if total > shown:
+        lines.append(f"[+{total - shown} more matches; narrow the path, the "
+                     f"pattern, or use include]")
+    return _cap_output("\n".join(lines)) or "[no matches]"
 
 
 def find_files(pattern, path="."):
@@ -432,29 +495,99 @@ def append_file(path, text):
             f"{len(new_content.splitlines())} lines]")
 
 
-def run_shell(cmd):
-    """Run `cmd` in a shell: (capped combined output, exit code), or (None,
-    None) on timeout. Shared by run_cmd and the user's `!cmd` prompt escape,
-    so both see the same cap and timeout."""
+class CommandInterrupted(KeyboardInterrupt):
+    """Ctrl-C while run_shell's command ran, carrying what it printed so far.
+
+    Still a KeyboardInterrupt, so the turn aborts exactly as before; the
+    output rides along so run_turn can tell the model the command *did* run
+    (and may have changed files) instead of claiming it never started.
+    """
+
+    def __init__(self, output):
+        super().__init__()
+        self.output = output
+
+
+def _kill_group(proc):
+    # start_new_session made the shell a process-group leader, so its pid is
+    # the group id; the group holds every child it started, `cmd &` included.
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def _collect_after_kill(proc):
+    """Drain what the killed group printed. Bounded: a grandchild that left
+    the group (setsid, a daemonizing server) can still hold the pipe open,
+    and waiting on it is the hang this whole dance exists to avoid."""
     try:
-        out = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=config.CMD_TIMEOUT
+        out, _ = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired as e:
+        out = e.output or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        for f in (proc.stdout, proc.stdin):
+            with contextlib.suppress(OSError, AttributeError):
+                f.close()
+    return out or ""
+
+
+def run_shell(cmd, timeout=None):
+    """Run `cmd` in a shell: (capped combined output, exit code, timed_out).
+    Shared by run_cmd and the user's `!cmd` prompt escape, so both see the
+    same cap and timeout.
+
+    Popen in its own session rather than subprocess.run: run's timeout kills
+    only the shell, and a grandchild still holding the pipe (a dev server,
+    `cmd &`) kept communicate() blocked long past the timeout. Killing the
+    whole process group closes every copy of the pipe, and the output
+    gathered before the kill is returned instead of dropped — it usually
+    says why the command hung. stdin is /dev/null so a command waiting for
+    input gets EOF at once instead of sitting there until the timeout.
+    """
+    timeout = timeout or config.CMD_TIMEOUT
+    try:
+        proc = subprocess.Popen(
+            cmd, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, errors="replace",
+            start_new_session=True,
         )
+    except OSError as e:
+        return f"[could not start the shell: {e}]", 127, False
+    timed_out = False
+    try:
+        out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None, None
-    combined = (out.stdout + out.stderr).strip()
+        _kill_group(proc)
+        out       = _collect_after_kill(proc)
+        timed_out = True
+    except KeyboardInterrupt:
+        # In its own session the command never saw the terminal's SIGINT,
+        # so stop it here, or it would outlive the turn it belonged to.
+        _kill_group(proc)
+        raise CommandInterrupted(_cap_output(_collect_after_kill(proc).strip(),
+                                             config.MAX_CMD_CHARS))
     # Keep head AND tail: test runners and builds put the failure summary at
     # the end, and losing it makes the model re-run the command.
-    return _cap_output(combined, config.MAX_CMD_CHARS), out.returncode
+    return _cap_output(out.strip(), config.MAX_CMD_CHARS), proc.returncode, timed_out
 
 
-def run_cmd(cmd):
+def run_cmd(cmd, timeout=None):
     ok, reason = confirm(f"run: {cmd}")
     if not ok:
         return declined("command", reason)
-    combined, code = run_shell(cmd)
-    if code is None:
-        return f"[timed out after {config.CMD_TIMEOUT}s]"
+    # Clamped: under --yes the model's number is the only limit there is.
+    limit = config.CMD_TIMEOUT
+    if timeout:
+        limit = max(1, min(int(timeout), config.MAX_CMD_TIMEOUT))
+    combined, code, timed_out = run_shell(cmd, limit)
+    if timed_out:
+        # What happened, then the two fixes a small model can act on; a bare
+        # "[timed out]" made it rerun the identical command.
+        return ((combined + "\n" if combined else "")
+                + f"[timed out after {limit}s and was killed. If it just needs "
+                f"longer, run it again with timeout=SECONDS (at most "
+                f"{config.MAX_CMD_TIMEOUT}). If it waits for input or never exits "
+                f"(a server, a watcher), do not run it with run_cmd.]")
     if not combined:
         return f"[exit {code}, no output]"
     # A failure with output used to look exactly like a success: the code was

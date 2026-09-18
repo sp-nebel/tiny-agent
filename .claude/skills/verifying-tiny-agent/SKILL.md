@@ -122,6 +122,9 @@ Run `python3 local_agent.py` and exercise:
   unescaped).
 - Ctrl-C while a tool is running — the turn aborts but history stays well-formed
   (stub `[interrupted before this tool ran]` results pair up any pending tool_calls).
+  Ctrl-C during `run_cmd` answers that call with its partial output plus
+  `[the user stopped this command …]`, and the command's process group is gone
+  (`ps` shows no leftover `sleep`).
 - `!git status` then a question about it — the model answers from the output; `!!ls` shows
   output but the model never sees it.
 - `@README.md summarize` prints `attached README.md` and the answer draws on the file;

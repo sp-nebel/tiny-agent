@@ -39,7 +39,8 @@ python local_agent.py
 | `--yes` | off | Auto-approve all writes and shell commands |
 | `--max-steps N` | 20 | Max tool round-trips before giving up on a task — one round can include several tool calls if the model requests them together, so this isn't a raw tool-call count (`0` = unlimited) |
 | `--check-every N` | 20 | Every N tool round-trips, ask the model whether its recent steps are repeating without new information; `STUCK` ends the turn on its explanation and hands control back, anything else lets it continue (`0` = never). Inert under the default `--max-steps 20` — the check could only fire as the cap ends the turn anyway — so it is meant for `--max-steps 0` or a higher cap |
-| `--resume [NAME]` | off | Resume a saved session by name; bare `--resume` resumes the most recent |
+| `--resume NAME` | off | Resume the saved session `NAME` |
+| `-c`, `--continue` | off | Resume the most recent saved session. Takes no value, so `-c "fix the test"` resumes and then runs the prompt |
 
 ### Environment variables
 
@@ -79,13 +80,13 @@ While the model composes a tool call nothing streams — Ollama sends the call a
 | Tool | Description |
 |------|-------------|
 | `read_file` | Read a file with optional line range (capped at 100 lines per call) |
-| `grep` | Search files by regex (with optional context lines), rg/grep auto-detection |
+| `grep` | Search files by regex (extended syntax), with optional context lines and an `include` glob (`*.py`). Hits are grouped under their file, lines are cut at 300 chars, and the overflow notice says to narrow the search. rg or grep is auto-detected; the output is the same either way |
 | `find_files` | Glob-pattern file search |
 | `list_dir` | List directory contents |
 | `cd` | Change the working directory |
 | `edit_file` | Exact-string replacement edit, or create a new file (an empty existing file counts as new); CRLF files keep their line endings, and bytes outside the replacement are never rewritten |
 | `append_file` | Append text to the end of a file (creating it if missing); inserts a separating newline if needed and keeps the file's line endings |
-| `run_cmd` | Run a shell command; a non-zero exit code is appended to the output as `[exit N]` |
+| `run_cmd` | Run a shell command; a non-zero exit code is appended to the output as `[exit N]`. Optional `timeout` (default 120s, max 600s). On a timeout the whole process group is killed, background children included, and the output so far is kept with a note on what to do next. stdin is `/dev/null`, so a command that waits for input ends at once |
 
 `edit_file`, `append_file` and `run_cmd` ask for confirmation before executing unless `--yes` is passed. Edits show a colored unified diff before the confirmation prompt (and under `--yes`, as a record of what changed). The prompt is `[y/N/reason]`: `y` approves, empty/`n` declines, and anything else declines *and* is passed back to the model as the reason — `use the test runner, not python directly` redirects it, where a bare refusal tends to make a small model re-issue the identical call.
 
@@ -129,7 +130,8 @@ Newest first. Every commit adds its entry here (see `CLAUDE.md`).
 
 ### 2026-09-18
 
-- **`edit_file` keeps CRLF line endings; `run_cmd` reports failures**: editing a Windows-style file no longer rewrites all its line endings to LF. Only the replaced text changes, even in files with mixed endings. A command that fails with output now ends with `[exit N]`; before, the exit code was only shown when there was no output, so a failing test run looked like a pass.
+- **`run_cmd` no longer hangs, Ctrl-C tells the truth, `-c/--continue`, grep grouped by file**: a command that starts a background process (`cmd &`, a dev server) used to block `run_cmd` long past its timeout, and the output gathered before a timeout was thrown away. The command now runs in its own process group, which is killed as a whole on a timeout or Ctrl-C, and its partial output is kept. A timed-out command's result explains how to pass the new `timeout` parameter (max 600s). A command stopped with Ctrl-C is reported to the model as partly run instead of "interrupted before this tool ran", and Ctrl-C during a `!cmd` no longer crashes the agent. `--resume` now needs a name; `-c/--continue` resumes the most recent session, so `--resume "fix the test"` can't swallow the prompt anymore. `grep` gained an `include` glob, prints each file's path once above its hits, cuts lines at 300 chars and uses extended regex on both backends. The two schema additions cost one re-prefill of the static prefix after upgrading.
+- **`edit_file` keeps CRLF line endings; `run_cmd` reports failures** (`366c860`): editing a Windows-style file no longer rewrites all its line endings to LF. Only the replaced text changes, even in files with mixed endings. A command that fails with output now ends with `[exit N]`; before, the exit code was only shown when there was no output, so a failing test run looked like a pass.
 - **`/undo` fixes** (`a7e94e8`): a multi-line prompt is printed on `/undo` instead of being put back into the single-line input buffer, where it garbled the display. Restore and remove messages now show only the path, and the README's cost note for rollbacks on SWA models now says the cost hasn't been measured.
 - **Multi-line prompts with a trailing `\`** (`1eeb6dc`): a line ending in `\` opens a `...` continuation prompt, and the lines are sent as one message. This works in the main prompt only; `interject` and `steer` stay single-line.
 - **`@path` attachments** (`1b84ee4`): any `@token` in a prompt that names an existing file attaches that file's contents to the message. They're rendered by `read_file`, so the model gets the same line cap and read-on instruction as its own reads.

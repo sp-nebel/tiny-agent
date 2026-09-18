@@ -130,3 +130,17 @@ def test_undoing_a_multiline_prompt_does_not_prefill_it(monkeypatch, tmp_path):
     r = Repl(monkeypatch, ["a \\", "b", "/undo"]).run()
     assert r.turns[0].endswith("a \nb")
     assert r.seeds[-1] == ""              # readline can't hold the newline
+
+
+def test_resume_takes_a_name_and_prompt_stays_a_prompt(monkeypatch, tmp_path):
+    # `--resume "fix the test"` used to read the prompt as a session name.
+    import argparse
+    seen = {}
+    monkeypatch.setattr(agent, "resolve_session", lambda name: seen.setdefault("name", name))
+    monkeypatch.chdir(tmp_path)
+    r = Repl(monkeypatch, [])
+    monkeypatch.setattr("sys.argv", ["local_agent.py", "-c", "fix the test"])
+    monkeypatch.setattr(agent, "load_session", lambda name: (_ for _ in ()).throw(OSError()))
+    r.run()
+    assert seen["name"] == ""                 # -c: the most recent session
+    assert r.turns[0].endswith("fix the test")

@@ -12,7 +12,7 @@ from rich.markup import escape
 
 import config
 import checkpoint
-from tools import dispatch, read_file, run_shell
+from tools import dispatch, read_file, run_shell, CommandInterrupted
 from ollama import call_ollama, warm_cache
 from ui import (read_prompt, read_multiline, fmt_args, truncate, fmt_stats,
                 take_interjections, interjections_pending)
@@ -71,6 +71,10 @@ INTERJECTION_PREFIX = "[user message sent mid-task] "
 STOP_NOTE_PREFIX = ("[the user interrupted you with this note; follow it, "
                     "then continue the task]\n")
 STOP_NOTE_DEFAULT = "Stop and reconsider what you were about to do."
+
+# Result for a run_cmd the user stopped with Ctrl-C, after whatever it printed.
+USER_STOPPED_CMD = ("[the user stopped this command before it finished; it may "
+                    "have partly run]")
 
 
 def deliver_interjections(messages):
@@ -572,7 +576,17 @@ def run_turn(messages, max_steps=20, check_every=20):
                     # bracketed metadata like "[lines 1-100 of 543]" — must be
                     # escaped or the user sees them vanish.
                     config.console.print(f"[cyan]→ {escape(name)}({escape(fmt_args(args))})[/cyan]")
-                    result = dispatch(name, args)
+                    try:
+                        result = dispatch(name, args)
+                    except CommandInterrupted as e:
+                        # The command ran, partly: it may have changed files,
+                        # so "interrupted before this tool ran" would be a lie
+                        # the model acts on. Answer this call with what it
+                        # printed; the finally stubs any calls after it.
+                        stopped = ((e.output + "\n") if e.output else "") + USER_STOPPED_CMD
+                        messages.append({"role": "tool", "content": stopped, "name": name})
+                        answered += 1
+                        raise
                     config.console.print(f"[dim]{escape(truncate(result))}[/dim]\n")
 
                     # Tool results use role "tool", one message per call.
@@ -632,10 +646,17 @@ def run_shell_escape(cmd):
     the model gets is capped the same way. A subshell, so `!cd` changes
     nothing that outlives it.
     """
-    output, code = run_shell(cmd)
-    if code is None:
+    try:
+        output, code, timed_out = run_shell(cmd)
+    except CommandInterrupted as e:
+        # Ctrl-C at the prompt used to escape main() with a traceback. The
+        # user stopped their own command: keep what it printed, like a
+        # timeout, rather than losing it.
+        output, timed_out, code = e.output, False, None
+    if timed_out:
         status = f"timed out after {config.CMD_TIMEOUT}s"
-        output = ""
+    elif code is None:
+        status = "stopped with Ctrl-C"
     else:
         status = f"exit {code}"
     if output:
@@ -741,9 +762,16 @@ def main():
     ap.add_argument("--check-every", type=int, default=20,
                     help="every N tool round-trips, ask the model whether it is looping and "
                          "stop if it says so (0 = never; inert under the default --max-steps)")
-    ap.add_argument("--resume",    nargs="?", const="", default=None,
-                     help="resume a saved session by name; bare --resume resumes the most recent")
+    # --resume takes a required name, and "the most recent" is a separate
+    # flag with no value: an optional value next to the nargs="*" prompt
+    # made `--resume "fix the test"` read the prompt as a session name.
+    ap.add_argument("--resume",    metavar="NAME", default=None,
+                    help="resume the saved session NAME")
+    ap.add_argument("-c", "--continue", dest="cont", action="store_true",
+                    help="resume the most recent saved session")
     args = ap.parse_args()
+    if args.cont and args.resume is None:
+        args.resume = ""
 
     if args.model:
         config.MODEL = args.model

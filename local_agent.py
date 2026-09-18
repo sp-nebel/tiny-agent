@@ -28,6 +28,8 @@ Design decisions (the "why" behind the code):
 Usage:
     python local_agent.py "review the null handling in AuthService"
     python local_agent.py            # interactive; seed a task at the prompt
+    python local_agent.py -c                 # resume the most recent session
+    python local_agent.py --resume NAME      # resume a named session
     python local_agent.py --max-steps 0 --check-every 10
                                      # no step cap; every 10 steps ask the model
                                      # whether it is looping, stop if it says so

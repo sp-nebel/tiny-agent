@@ -13,10 +13,14 @@ SESSION_DIR = os.path.expanduser("~/.tiny_agent_sessions")
 
 MAX_READ_LINES = 100
 MAX_GREP_HITS  = 20
+GREP_MAX_LINE_CHARS = 300
 MAX_GLOB_HITS  = 20
 MAX_LIST_HITS  = 200
 MAX_CMD_CHARS  = 8000
 CMD_TIMEOUT    = 120
+# Ceiling on run_cmd's per-call timeout parameter — under --yes the model's
+# own number would otherwise be the only limit.
+MAX_CMD_TIMEOUT = 600
 
 # Ollama's host-memory prompt-cache saves (and, for SWA models, per-checkpoint
 # state) scale with resident context tokens. On memory-constrained boxes a
@@ -142,12 +146,13 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search for a regex pattern in a file or directory tree. Returns matching lines with file path and line number.",
+            "description": "Search for a regex pattern in a file or directory tree. Returns matching lines grouped by file, each as line number and text.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string",  "description": "Search pattern (regex)"},
                     "path":    {"type": "string",  "description": "File or directory to search (default '.')"},
+                    "include": {"type": "string",  "description": "Only search files whose name matches this glob, e.g. '*.py'"},
                     "context": {"type": "integer", "description": "Show N lines of context before AND after each match (-C)"},
                     "before":  {"type": "integer", "description": "Show N lines before each match (-B); ignored if context is set"},
                     "after":   {"type": "integer", "description": "Show N lines after each match (-A); ignored if context is set"},
@@ -284,7 +289,8 @@ TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "cmd": {"type": "string", "description": "Shell command to run"},
+                    "cmd":     {"type": "string",  "description": "Shell command to run"},
+                    "timeout": {"type": "integer", "description": "Seconds before the command is killed (default 120, max 600)"},
                 },
                 "required": ["cmd"],
             },
