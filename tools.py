@@ -91,6 +91,14 @@ def confirm(msg: str, allow=None):
     """
     if config.AUTO_YES:
         return True, ""
+    if not config.INTERACTIVE:
+        # stdin was piped: there is no one to ask. Refuse, and say why in
+        # terms the model can act on instead of a bare "declined".
+        config.console.print(f"[yellow]refused without a terminal to confirm: "
+                             f"{escape(msg)} (rerun with --yes to allow)[/yellow]")
+        return False, ("there is no terminal to confirm this in this run, so "
+                       "edits and commands are refused. Answer with what you "
+                       "found and what you would change")
     if allow and allow[0] in _always_allowed:
         config.console.print(f"[dim]auto-approved ({escape(allow[1])} are allowed "
                              f"this session)[/dim]")

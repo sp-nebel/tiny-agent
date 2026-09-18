@@ -145,6 +145,8 @@ Run `python3 local_agent.py` and exercise:
 - `/editor` opens `$EDITOR`; the saved text is sent as a prompt even if it starts with `!`.
 - `/history` then `/undo 2` rewinds two turns (files too, in a git repo).
 - `/export` writes a readable Markdown transcript; `/sessions` shows first-prompt titles.
+- `echo 'what is 2+2' | python3 local_agent.py > out.md` runs one turn: `out.md` holds only the
+  answer, everything else went to stderr, and an edit attempt without `--yes` is refused.
 - Ask for a long file edit: while the tool call is composed silently, the live region shows
   `generating… Ns without visible output` after ~2s and Esc still cancels. The next prompt
   must answer promptly — if it hangs for minutes, the abandoned generation wasn't torn down

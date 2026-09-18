@@ -53,10 +53,27 @@ class Repl:
         monkeypatch.setattr(agent.atexit, "register", lambda *a, **k: None)
         monkeypatch.setattr(agent, "readline", None)
         monkeypatch.setattr("sys.argv", ["local_agent.py"])
+        # A terminal, as far as main() can tell: pytest's own stdin isn't
+        # one, and a non-tty stdin switches main() into piped one-shot mode.
+        monkeypatch.setattr("sys.stdin", FakeTTY(""))
 
     def run(self):
         agent.main()
         return self
+
+
+class FakeTTY:
+    """stdin stand-in: a terminal by default, or a pipe holding `text`."""
+
+    def __init__(self, text, tty=True):
+        self.text, self.tty = text, tty
+
+    def isatty(self):
+        return self.tty
+
+    def read(self):
+        text, self.text = self.text, ""
+        return text
 
 
 def test_bang_output_rides_with_the_next_prompt(monkeypatch, tmp_path):

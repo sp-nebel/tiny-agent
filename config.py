@@ -137,6 +137,14 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv",
 REPEAT_CALL_LIMIT = 3
 
 AUTO_YES = False
+# False when stdin is piped: confirm() can't ask, so it refuses (unless
+# AUTO_YES). ANSWER_TO_STDOUT is set when stdout is piped too: only the
+# final answer goes there, and the console writes to stderr.
+INTERACTIVE      = True
+ANSWER_TO_STDOUT = False
+# Cap on text piped in on stdin; the rest is saved to a file like any
+# oversized tool output, and the notice gives its path.
+MAX_PIPED_CHARS  = 16000
 # Ask the model to emit reasoning in a separate `thinking` field. Streamed
 # live as feedback on slow CPU runs, then discarded once the answer lands.
 # Auto-disabled at runtime if the model doesn't support thinking.

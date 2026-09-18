@@ -29,7 +29,12 @@ python local_agent.py "review the null handling in AuthService"
 
 # Interactive mode
 python local_agent.py
+
+# Pipe input in: one turn, then exit
+git diff | python local_agent.py "review this diff" > review.md
 ```
+
+When stdin is not a terminal, the piped text goes to the model ahead of your prompt, marked `[input piped to the agent by the user]` (with no prompt, the piped text *is* the prompt). The agent runs one turn and exits, with code 1 if the turn failed. If stdout is not a terminal either, only the final answer is written there, as plain Markdown, and everything else goes to stderr. Nobody can answer a confirmation in this mode, so edits and commands are refused unless you pass `--yes`, and the model is told why. Piped input over 16000 chars is cut in the middle, like an oversized tool result, and saved in full to a file the model can read.
 
 ### CLI flags
 
@@ -163,7 +168,8 @@ Newest first. Every commit adds its entry here (see `CLAUDE.md`).
 
 ### 2026-09-18
 
-- **Custom commands, `/help`, `/history`, `/undo N`, `/export`, `/editor`, line ranges, Tab completion, session titles**: Markdown files in `.tiny-agent/commands/` or `~/.config/tiny-agent/commands/` become `/name` commands, with `$ARGUMENTS`, `$1`…`$9`, `` !`cmd` `` and `@file` filled in; `/help` lists them with the built-ins. `/history` numbers the conversation's turns, and `/undo N` takes back several at once. `/export` writes the conversation to Markdown, and `/editor` composes a prompt in `$EDITOR`. `@path#10-40` attaches just those lines, and Tab completes `@paths` and `/commands`. `/sessions` shows each session's first prompt as its title. A mistyped `/command` is no longer sent to the model as a prompt.
+- **Stdin piping**: `git diff | local_agent.py "review this"` sends the piped text with the prompt, runs one turn and exits (code 1 if it failed). With stdout piped as well, only the final answer goes to stdout, as plain Markdown. Without a terminal, edits and commands are refused unless `--yes` is given.
+- **Custom commands, `/help`, `/history`, `/undo N`, `/export`, `/editor`, line ranges, Tab completion, session titles** (`fc7a609`): Markdown files in `.tiny-agent/commands/` or `~/.config/tiny-agent/commands/` become `/name` commands, with `$ARGUMENTS`, `$1`…`$9`, `` !`cmd` `` and `@file` filled in; `/help` lists them with the built-ins. `/history` numbers the conversation's turns, and `/undo N` takes back several at once. `/export` writes the conversation to Markdown, and `/editor` composes a prompt in `$EDITOR`. `@path#10-40` attaches just those lines, and Tab completes `@paths` and `/commands`. `/sessions` shows each session's first prompt as its title. A mistyped `/command` is no longer sent to the model as a prompt.
 - **`a` = always allow at the confirmation prompt** (`60c4efc`): the prompt is now `[y/N/a/reason]`. `a` on an edit allows all edits for the rest of the session. On a command, it allows commands with the same prefix (`git checkout …`, `npm run dev …`, `pytest …`). Commands that chain, pipe, redirect or substitute always ask.
 - **Quieter tool display, `/details`, `/thinking`, richer stats, notifications** (`19648c6`): each tool call now prints one line with its outcome (`→ grep "foo" (7 matches)`), and a result's body appears only when the call failed or `/details` is on. `/thinking` hides the live reasoning view without changing the request. The stats line adds the turn's total time and the share of the context window in use, and the live region counts queued messages. A turn that ran 20s or more rings the bell and sends a desktop notification when it ends or waits for a confirmation (`AGENT_NOTIFY=0` turns this off).
 - **Retry with backoff** (`67adeff`): a request to Ollama that fails before anything streams (connection refused or reset, HTTP 429/500/502/503/504) is retried up to 5 times with exponential backoff (2s doubling to 30s, with jitter), instead of a single retry on a refused connection. A context overflow and any 4xx are never retried.

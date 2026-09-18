@@ -9,13 +9,15 @@ import threading
 import contextlib
 import urllib.error
 
+from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape
 
 import config
 import commands
 import checkpoint
-from tools import dispatch, read_file, run_shell, normalize_call, CommandInterrupted
+from tools import (dispatch, read_file, run_shell, normalize_call, _cap_output,
+                   CommandInterrupted)
 from ollama import call_ollama, warm_cache
 from ui import (read_prompt, read_multiline, fmt_args, truncate, fmt_stats,
                 take_interjections, interjections_pending, mark_turn_start,
@@ -410,6 +412,18 @@ def _add_stats(turn_stats, stats):
     _note_prefill_rate(stats)
 
 
+def _print_answer(content):
+    """A turn's final answer: rendered Markdown on the terminal, or the raw
+    text on stdout when that is a pipe (everything else then goes to
+    stderr), so `… | local_agent.py "review" > review.md` keeps just the
+    answer."""
+    if config.ANSWER_TO_STDOUT:
+        sys.stdout.write(content.strip() + "\n")
+        sys.stdout.flush()
+    else:
+        config.console.print(Markdown(content))
+
+
 TOOL_NAMES = ("read_file", "grep", "find_files", "list_dir", "cd",
               "edit_file", "append_file", "run_cmd")
 
@@ -505,7 +519,7 @@ def run_turn(messages, max_steps=20, check_every=20):
                     messages.append({"role": "assistant", "content": content})
                     config.console.print("[yellow]model reports it is stuck after "
                                          f"{step} steps — handing back to you[/yellow]")
-                    config.console.print(Markdown(content))
+                    _print_answer(content)
                     return
                 # CONTINUE, a tool call, or anything else: the probe is
                 # discarded and work goes on with a fresh budget.
@@ -577,7 +591,7 @@ def run_turn(messages, max_steps=20, check_every=20):
 
                 # Final answer (normal early finish, or the forced last step).
                 if content.strip():
-                    config.console.print(Markdown(content))
+                    _print_answer(content)
                 elif last:
                     config.console.print("[yellow]hit step limit; model returned no answer[/yellow]")
                 else:
@@ -808,6 +822,11 @@ def run_shell_escape(cmd):
     config.console.print(f"[dim]{escape(status)}[/dim]")
     return SHELL_BLOCK_HEAD.format(cmd=cmd, status=status) + "\n" + (output or "[no output]")
 
+# Leads text piped in on stdin, which rides ahead of the prompt in the first
+# message like `!cmd` output does. Says where it came from, so the model
+# doesn't take a diff for something it produced.
+PIPED_HEAD = "[input piped to the agent by the user]"
+
 # An `@path` token: at the start of the prompt or after whitespace, so an
 # email address or a decorator in pasted code is not one.
 FILE_REF_RE     = re.compile(r"(?<!\S)@(\S+)")
@@ -943,6 +962,22 @@ def main():
         config.MODEL = args.model
     config.AUTO_YES = args.yes
 
+    # stdin that isn't a terminal is input, not a keyboard: `git diff |
+    # local_agent.py "review this"` runs one turn on it and exits. Nobody
+    # can answer a confirmation, so writes and commands need --yes (see
+    # tools.confirm). With stdout piped too, only the answer goes there.
+    piped      = not sys.stdin.isatty()
+    piped_text = ""
+    if piped:
+        piped_text         = sys.stdin.read()
+        config.INTERACTIVE = False
+        if not sys.stdout.isatty():
+            config.ANSWER_TO_STDOUT = True
+            config.console          = Console(stderr=True)
+        if not args.prompt and not piped_text.strip():
+            config.console.print("[red]nothing to do: no prompt and nothing on stdin[/red]")
+            sys.exit(2)
+
     # Persistent prompt history: importing readline upgrades input() in place,
     # so config.console.input gets line editing and up-arrow recall for free.
     if readline:
@@ -1016,6 +1051,15 @@ def main():
             config.console.print("[yellow]no matching session; starting fresh[/yellow]")
 
     initial = " ".join(args.prompt).strip()
+    # Piped text is sent as it is, never parsed as `!cmd` or `/command`.
+    literal_first = False
+    if piped and piped_text.strip():
+        if initial:
+            pending_shell.append(PIPED_HEAD + "\n" + _cap_output(piped_text.strip(),
+                                                                 config.MAX_PIPED_CHARS))
+        else:
+            initial       = piped_text.strip()
+            literal_first = True
 
     # Interactive start: prefill the static prefix — or, if a session was just
     # restored, the full restored history — while the user types their first
@@ -1027,15 +1071,16 @@ def main():
         threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
 
     config.console.print(f"[bold]tiny-agent[/bold] · {escape(config.MODEL)} · {escape(os.getcwd())}")
-    config.console.print(
-        "[dim]model warms up in the background; the first reply is slow if it "
-        "hasn't finished. later turns reuse the KV cache. while a reply "
-        "streams, just start typing to queue a message for the model; Tab "
-        "stops the reply now so you can steer it; Esc cancels the reply. "
-        "'!cmd' runs a shell command and sends its output with your next "
-        "message, '@path' attaches a file, '/undo' takes back the last turn, "
-        "'/help' lists every command, 'exit' quits.[/dim]\n"
-    )
+    if not piped:
+        config.console.print(
+            "[dim]model warms up in the background; the first reply is slow if it "
+            "hasn't finished. later turns reuse the KV cache. while a reply "
+            "streams, just start typing to queue a message for the model; Tab "
+            "stops the reply now so you can steer it; Esc cancels the reply. "
+            "'!cmd' runs a shell command and sends its output with your next "
+            "message, '@path' attaches a file, '/undo' takes back the last turn, "
+            "'/help' lists every command, 'exit' quits.[/dim]\n"
+        )
 
     while True:
         if initial:
@@ -1055,8 +1100,8 @@ def main():
         raw_prompt = user
         # Text written in /editor is a prompt, whatever it starts with: a
         # first line of "!rm …" or "/save x" must not run as a command.
-        literal = False
-        if user.lower() == "/editor":
+        literal, literal_first = literal_first, False
+        if not literal and user.lower() == "/editor":
             text = commands.edit_in_editor()
             if text is None or not text.strip():
                 if text is not None:
@@ -1238,8 +1283,10 @@ def main():
         first_user_msg = False
         messages.append({"role": "user", "content": content})
 
+        failed = True
         try:
             run_turn(messages, max_steps=args.max_steps, check_every=args.check_every)
+            failed = False
         except urllib.error.HTTPError as e:
             body = getattr(e, "body", "") or e.read().decode(errors="replace")
             config.console.print(f"[red]Ollama error {e.code}: {escape(body.strip() or str(e.reason))}[/red]")
@@ -1267,3 +1314,6 @@ def main():
         if leftover:
             initial = "\n".join(leftover)
         config.console.print()
+        if piped:
+            # One turn per run; the exit code says whether it got an answer.
+            sys.exit(1 if failed else 0)

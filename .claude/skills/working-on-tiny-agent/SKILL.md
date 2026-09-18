@@ -1,6 +1,6 @@
 ---
 name: working-on-tiny-agent
-description: Start-here map for any code change in this repo (tiny-agent). Read before editing any .py file here — covers the master design constraint, module responsibilities, message-history invariants, and code conventions. Applies to agent.py, config.py, ollama.py, tools.py, session.py, checkpoint.py, ui.py, local_agent.py.
+description: Start-here map for any code change in this repo (tiny-agent). Read before editing any .py file here — covers the master design constraint, module responsibilities, message-history invariants, and code conventions. Applies to agent.py, config.py, ollama.py, tools.py, session.py, checkpoint.py, ui.py, commands.py, local_agent.py.
 ---
 
 # Working on tiny-agent
