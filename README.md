@@ -122,3 +122,29 @@ For typing, any keypress other than Esc or Tab opens a prompt for a message to t
 **Undo** — before every turn the working tree of the enclosing git repo is snapshotted as a git tree object, written through a *temporary* index (`GIT_INDEX_FILE`) seeded from the real one so only changed files are hashed. `/undo` diffs that tree against the current one and rewrites just the differing paths — edited and deleted files come back, files the turn created are removed — again through a temporary index, so the user's real index, staged changes, HEAD and stash are never touched. Because it is git and not a journal kept by the edit tools, changes made through `run_cmd` (a formatter, codegen, an `rm`) are undone too. What it can't undo: gitignored files, anything outside the repo, commits made during the turn (HEAD is left where it is, with a warning), and side effects that aren't file contents. The conversation side cuts the turn off the tail of history, so what remains is exactly a prefix of the last request: a full-attention model keeps it cached. On an SWA model (gemma) the rollback is expected to cost at most one re-prefill of what remains — the same kind of bust as a trim — and possibly only a checkpoint restore, like the loop-check probe's divergence; not yet measured. Either way it is paid once, at a moment you chose, and runs as a background warmup while you edit the restored prompt. The undo stack lives for the process only; `/clear` and `/resume` empty it.
 
 **Native tool calling** — tools are passed via Ollama's `tools` parameter as JSON schemas, not described in the system prompt, so the model uses the format it was actually trained on.
+
+## Changelog
+
+The last 15 commits (`c6efa18`…`8110c11`), newest first, plus work that is still uncommitted.
+
+### In progress (uncommitted)
+
+- **Shared shell runner for a `!cmd` prompt escape.** `run_cmd`'s execution path has been split out into `_run_shell`, which returns the capped output and exit code (or `None` on timeout). This lets `run_cmd` and a planned `!cmd` prompt escape share the same output cap and timeout. `run_cmd`'s results to the model are unchanged. The `!cmd` input itself hasn't landed yet.
+
+### 2026-09-18
+
+- **`/undo`** (`8110c11`): takes back the last turn. Files are restored from a git working-tree snapshot taken before the turn, through a temporary index. Files the turn created are removed, and the turn is cut off the history. Its prompt goes back into the input line. Your real index, HEAD and stash are never touched. Outside a git repo only the conversation is rewound. New module `checkpoint.py` with tests.
+- **Test suite** (`3a3ef62`, `5da78dd`): a pytest suite under `tests/` (86 tests at the time; 95 with the `/undo` tests) covering `run_turn` over a scripted fake model (interjections, Tab steering, the loop check), `append_file`, `confirm`, `edit_file`, `find_files`, `read_file`, output capping and history trimming. Six stale trim tests were fixed on the way. The project skills now document how to run and extend the suite.
+- **Loop check, `--check-every N`** (`bbd4eeb`): every N tool round-trips (default 20, `0` = never), the model is asked on a copy of the history whether it is going in circles. `STUCK` ends the turn on its explanation; `CONTINUE` leaves no trace. It does nothing under the default `--max-steps 20`. Use it with a higher cap or `--max-steps 0`.
+- **Tab to stop and steer** (`ab90903`): Tab stops a streaming reply immediately. The partial text and reasoning are kept, any pending tool call is dropped without running, and a `steer` prompt asks for a note the model must follow. It costs no step.
+- **Live view and keys stay responsive while a tool call is composed** (`80b1aef`): the response is read on a pump thread, so Esc and typing work during the silent phase and an elapsed-time notice replaces the frozen display. Cancelling shuts the socket down, so Ollama actually stops generating the abandoned call.
+- **`append_file` tool** (`16c2e1b`): appends text to a file or creates it. It inserts a separating newline if needed, keeps line endings, and shows the same diff and confirmation as `edit_file`.
+- **`edit_file` can fill an empty file** (`56b89a3`): an empty `old_string` on an existing empty file now writes the contents instead of being refused.
+- **Rich markup escaping** (`cce49de`): tool results like `[lines 1-100 of 543]` and the `[y/N/reason]` hint were silently swallowed as markup tags. Interpolated text is now escaped at every console site.
+- Docs: the verification checklist covers the new key paths (`ea5a327`), and the key table says "any other key" (`e72da6a`).
+
+### 2026-09-15
+
+- **Interjections and denial reasons** (`0ba6421`): any key during a reply opens an `interject` prompt. The message is queued and delivered at the next step boundary, or as the next prompt if the turn ends first. The confirmation prompt is now `[y/N/reason]`, and a typed reason is passed back to the model so it changes course instead of repeating the call.
+- **Trimming prefers stubbing tool outputs over shedding thinking** (`41d5b1c`): a mid-turn trim stubs every tool result the model has already replied to. Old thinking is dropped only when stubbing alone isn't enough.
+- **Mid-turn updates stay on screen** (`c6efa18`, merged in #4 as `352d7f8`): prose that a step writes alongside its tool calls is re-rendered above the `→ tool(...)` lines instead of vanishing with the live region.
