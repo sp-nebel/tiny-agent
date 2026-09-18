@@ -31,8 +31,10 @@ Usage:
 
 While a reply streams: any keypress opens a prompt for a message to the model
 (queued and delivered at the next step boundary, so the cached prefix is
-untouched), Esc alone cancels the reply. A declined edit or command can carry
-a reason, which is handed to the model in place of a bare refusal.
+untouched), Tab stops the reply now and asks for a note to steer it (the
+pending tool call is dropped), Esc alone cancels the reply. A declined edit
+or command can carry a reason, which is handed to the model in place of a
+bare refusal.
 
 Env vars:
     AGENT_MODEL           (default: gemma4:12b-it-qat)   — any Ollama model with tool support

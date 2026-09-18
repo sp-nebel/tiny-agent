@@ -22,7 +22,10 @@ read `verifying-tiny-agent`.
   KEEP BYTE-IDENTICAL — it is the cached prefix) and `TOOL_SCHEMAS` (also part of the cached
   prefix), plus all caps/thresholds. New knobs go here, env-var overridable where users might
   need them (`AGENT_*` naming).
-- `agent.py` — the loop. `run_turn` (one user task: repeated model calls + tool round-trips),
+- `agent.py` — the loop. `run_turn` (one user task: repeated model calls + tool round-trips;
+  `deliver_interjections` appends queued typed messages at each step boundary, and
+  `_stop_and_steer` commits a Tab-stopped partial reply without its tool_calls, plus the user's
+  note),
   `trim_history` (lazy mid-turn context shedding: stubs every already-processed tool output,
   sheds old thinking only as a fallback when that isn't enough, then the hard-truncate
   backstop; returns True when it edited history, which gives the next call a
@@ -33,7 +36,9 @@ read `verifying-tiny-agent`.
 - `ollama.py` — HTTP layer. `_build_payload` is the **single source of truth for request
   bodies**; both call sites (`call_ollama`, `warm_cache`) go through it so
   model/keep_alive/num_ctx can't drift. `call_ollama` streams and returns
-  `(content, thinking, tool_calls, cancelled, stats)`.
+  `(content, thinking, tool_calls, cancelled, interrupted, stats)`, reading the response on a
+  pump thread (`_iter_with_ticks`) so keys work during silent tool-call composition; any exit
+  that abandons a live stream must call `_abort_stream` or Ollama keeps generating.
 - `tools.py` — tool implementations + `dispatch`. Tools return strings and never raise.
 - `session.py` — save/resume persistence (`~/.tiny_agent_sessions/`). `apply_session` mutates
   the `messages` list in place (`messages[:] = ...`) so the autosave closure keeps seeing it —
@@ -56,6 +61,10 @@ non-obvious ways. Any change must preserve:
 4. Nudges (`STEP_LIMIT_NUDGE`, `EMPTY_RETRY_NUDGE`) and the empty assistant replies that
    prompt them are transient: stripped at turn end by `strip_nudges`, and filtered again on
    session restore via `_is_stray_nudge` (a crash can persist one into an autosaved session).
+   User messages typed mid-turn (`INTERJECTION_PREFIX`, queued) and Tab-stop notes
+   (`STOP_NOTE_PREFIX`) are *not* nudges: they are real user input and stay in history. A
+   Tab-stopped partial reply is committed without its tool_calls; if only thinking was there,
+   `drop_thinking` empties it and `strip_nudges` removes the empty shell.
 5. Trimming is idempotent via the `TRIM_PREFIX` sentinel: every compacted/truncated message
    starts with it and is skipped on later passes. Any new compaction mechanism must use it too.
 6. The forced final step (`last`) drops unanswered `tool_calls` from the stored assistant

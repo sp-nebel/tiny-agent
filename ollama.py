@@ -138,15 +138,18 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
     in sight.
 
     Returns (content: str, thinking: str, tool_calls: list, cancelled: bool,
-    stats: dict). Exactly one of content/tool_calls is meaningful: a final
-    answer has content and no tool_calls; a tool-calling turn has tool_calls.
+    interrupted: bool, stats: dict). Exactly one of content/tool_calls is
+    meaningful: a final answer has content and no tool_calls; a tool-calling
+    turn has tool_calls.
     Reasoning arrives in a separate `thinking` field; it is shown live and now
     also returned, so run_turn can carry it on the assistant message and feed
     it back on the next step — keeping the model's chain of thought intact
     across tool round-trips until a final answer lands. cancelled is True if
-    the user pressed Esc mid-stream; stats is a dict of raw
-    token counters from the final chunk, empty ({}) in that case (the final
-    chunk never arrived) — run_turn sums it across the turn.
+    the user pressed Esc mid-stream. interrupted is True if they pressed Tab
+    to stop and steer: content/thinking then hold the reply so far and
+    tool_calls whatever had already arrived, which run_turn drops. stats is
+    a dict of raw token counters from the final chunk, empty ({}) in both
+    cases (the final chunk never arrived) — run_turn sums it across the turn.
 
     Any other key, polled the same way, opens a prompt for a mid-reply message
     to the model; that text is queued in ui (see read_interjection) rather than
@@ -158,13 +161,14 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
     if timeout is None:
         timeout = config.STREAM_TIMEOUT
 
-    content    = ""
-    thinking   = ""
-    tool_calls = []
-    cancelled  = False
-    stats      = {}
-    last_paint = 0.0
-    last_data  = time.monotonic()
+    content     = ""
+    thinking    = ""
+    tool_calls  = []
+    cancelled   = False
+    interrupted = False
+    stats       = {}
+    last_paint  = 0.0
+    last_data   = time.monotonic()
 
     # The outer try exists for the post-trim stall retry: the silent prefill
     # can time out either while waiting for the response headers (Ollama
@@ -204,8 +208,9 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
                                    _retried_refused=True)
             raise
 
-        # cbreak lets us catch a single keypress — Esc to cancel, anything
-        # else to interject — without blocking the stream; transient=True
+        # cbreak lets us catch a single keypress — Esc to cancel, Tab to
+        # stop and steer, anything else to interject — without blocking the
+        # stream; transient=True
         # clears the live region (thinking included) when done, so run_turn
         # re-renders the content it kept — a final answer or a mid-turn
         # update — while the thinking stays wiped.
@@ -218,6 +223,14 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
                         action, seed = poll_keypress()
                         if action == "cancel":
                             cancelled = True
+                            _abort_stream(resp)
+                            break
+                        if action == "stop":
+                            # Stop now, unlike a queued interjection: the
+                            # partial reply goes back to run_turn, which reads
+                            # the user's note. The generation is abandoned
+                            # just as surely as on Esc, so tear it down too.
+                            interrupted = True
                             _abort_stream(resp)
                             break
                         if action == "interject":
@@ -299,7 +312,7 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
                                _retried_refused=_retried_refused)
         raise
 
-    return content, thinking, tool_calls, cancelled, stats
+    return content, thinking, tool_calls, cancelled, interrupted, stats
 
 
 def warm_cache(messages=None):

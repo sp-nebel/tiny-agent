@@ -45,6 +45,15 @@ MAX_EMPTY_RETRIES = 2
 # nudges above — a bracketed lead-in on an appended user message.
 INTERJECTION_PREFIX = "[user message sent mid-task] "
 
+# Prefixes the note the user types after stopping a reply with Tab. Unlike a
+# queued interjection this one arrives *instead of* the step the model was
+# taking, so it says so, and in the imperative, because small models take
+# hints badly. A permanent user message, not a nudge: later turns must still
+# see why the model changed course.
+STOP_NOTE_PREFIX = ("[the user interrupted you with this note; follow it, "
+                    "then continue the task]\n")
+STOP_NOTE_DEFAULT = "Stop and reconsider what you were about to do."
+
 
 def deliver_interjections(messages):
     """Append whatever the user typed during the last step.
@@ -62,6 +71,42 @@ def deliver_interjections(messages):
         # it; print it again here, where it actually enters the conversation —
         # after the tool results of the step it was typed during.
         config.console.print(f"[bold green]you[/bold green] {escape(text)}")
+
+
+def _stop_and_steer(messages, content, thinking):
+    """Commit a Tab-stopped partial reply and read the user's note.
+
+    The user stopped the stream to steer, not to abort: the turn stays live
+    and nothing gathered so far is touched. The partial reply is committed as
+    an assistant message so the model keeps the reasoning it had (and the
+    note can refer to it), minus any tool_calls it had already emitted — a
+    call the user interrupted is exactly the one they didn't want run, and
+    storing it unanswered would break the tool_calls/results pairing.
+
+    Nothing is committed when the stream stopped before the first token:
+    history then ends user(prompt), user(note), which chat templates render
+    in sequence (strip_nudges can leave the same shape already). Everything
+    is appended at the tail, so the KV prefix cache is intact. At turn end
+    drop_thinking strips the partial's thinking, and if that leaves an empty
+    shell, strip_nudges removes it; the note itself is kept.
+    """
+    if content or thinking:
+        partial = {"role": "assistant", "content": content}
+        if thinking:
+            partial["thinking"] = thinking
+        messages.append(partial)
+    # The live region was transient, so the partial text just vanished from
+    # the screen; show it again — it is what the user is steering against.
+    if content.strip():
+        config.console.print(Markdown(content))
+    config.console.print("[yellow]stopped — the reply so far stays in context and "
+                         "any tool call it started is dropped. Type a note for "
+                         "the model (empty = reconsider)[/yellow]")
+    try:
+        note = read_prompt("[bold green]steer[/bold green] ").strip()
+    except EOFError:
+        note = ""
+    messages.append({"role": "user", "content": STOP_NOTE_PREFIX + (note or STOP_NOTE_DEFAULT)})
 
 
 def _msg_tokens(m):
@@ -336,7 +381,10 @@ def run_turn(messages, max_steps=20):
             # the whole prefill) and instead append a nudge at the *tail* — only its
             # own tokens prefill, so the prefix cache stays intact.
             last = max_steps > 0 and step == max_steps - 1
-            if last:
+            # A Tab-steer on the last step re-enters here without consuming
+            # the step; the nudge already sent stays in force, so don't stack
+            # a second copy after the user's note.
+            if last and STEP_LIMIT_NUDGE not in (m.get("content") for m in messages[turn_start:]):
                 messages.append({"role": "user", "content": STEP_LIMIT_NUDGE})
 
             # A trim pass just busted the prefix cache, so this call re-prefills
@@ -346,7 +394,7 @@ def run_turn(messages, max_steps=20):
             # after a genuine stall resumes nearly free); the next loop
             # iteration trims nothing (idempotent) and reverts to normal.
             timeout = _post_trim_timeout(messages) if trimmed else None
-            content, thinking, tool_calls, cancelled, stats = call_ollama(
+            content, thinking, tool_calls, cancelled, interrupted, stats = call_ollama(
                 messages, timeout=timeout, retry_stall=trimmed)
 
             if cancelled:
@@ -354,6 +402,13 @@ def run_turn(messages, max_steps=20):
                 # it to history) and hand control back to the prompt.
                 config.console.print("[yellow]cancelled[/yellow]")
                 return
+
+            if interrupted:
+                # Steering shouldn't cost budget: no step consumed. Any
+                # queued interjections follow the note at the next
+                # iteration's deliver_interjections.
+                _stop_and_steer(messages, content, thinking)
+                continue
 
             if stats:
                 calls += 1
@@ -555,8 +610,9 @@ def main():
     config.console.print(
         "[dim]model warms up in the background; the first reply is slow if it "
         "hasn't finished. later turns reuse the KV cache. while a reply "
-        "streams, just start typing to send the model a message; Esc "
-        "cancels the reply. '/clear' to reset context, '/save', '/resume', "
+        "streams, just start typing to queue a message for the model; Tab "
+        "stops the reply now so you can steer it; Esc cancels the reply. "
+        "'/clear' to reset context, '/save', '/resume', "
         "'/sessions' to pause/switch conversations (each takes an optional "
         "name), 'exit' to quit.[/dim]\n"
     )

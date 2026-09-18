@@ -80,10 +80,15 @@ ESC_SEQUENCE_WAIT = 0.02
 def poll_keypress():
     """Classify one waiting keypress as (action, seed). Non-blocking.
 
-    Actions: 'cancel' (Esc), 'interject' (Enter, or any printable character —
-    which comes back as `seed`, the first character of the message, since
-    cbreak turns echo off and it would otherwise be lost), or None for
-    everything else.
+    Actions: 'cancel' (Esc), 'stop' (Tab — stop the reply now and steer it),
+    'interject' (Enter, or any printable character — which comes back as
+    `seed`, the first character of the message, since cbreak turns echo off
+    and it would otherwise be lost), or None for everything else.
+
+    Tab is the stop key because nothing else wanted it: it is unprintable,
+    so it could never start a message, and it used to be ignored here. Only
+    while the stream owns the keyboard, though — inside the interject prompt
+    readline has the terminal back and Tab is its own completion key.
 
     Esc only cancels when it arrives alone: arrow keys and friends are escape
     *sequences*, and cancelling a long reply because the user pressed Up would
@@ -101,11 +106,13 @@ def poll_keypress():
         while select.select([sys.stdin], [], [], 0)[0]:
             sys.stdin.read(1)
         return None, ""
+    if ch == "\t":
+        return "stop", ""
     if ch in ("\r", "\n"):
         return "interject", ""
     if ch.isprintable():
         return "interject", ch
-    return None, ""     # backspace, tab, stray control characters
+    return None, ""     # backspace, stray control characters
 
 
 BRACKETED_PASTE_ON  = "\x1b[?2004h"
@@ -261,8 +268,8 @@ def _render_stream(thinking: str, content: str, quiet_s: float = 0.0) -> Text:
         if thinking or content:
             out.append("\n\n")
         out.append(f"generating… {quiet_s:.0f}s without visible output (a tool call "
-                   f"arrives whole once it is finished). Esc cancels, typing "
-                   f"queues a message.", style="dim italic")
+                   f"arrives whole once it is finished). Esc cancels, Tab stops "
+                   f"to steer, typing queues a message.", style="dim italic")
     return out
 
 # --------------------------------------------------------------------------- #
