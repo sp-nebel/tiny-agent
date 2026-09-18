@@ -37,7 +37,9 @@ While a reply streams: any keypress opens a prompt for a message to the model
 untouched), Tab stops the reply now and asks for a note to steer it (the
 pending tool call is dropped), Esc alone cancels the reply. A declined edit
 or command can carry a reason, which is handed to the model in place of a
-bare refusal.
+bare refusal. `/undo` takes back the last turn: its messages leave the
+conversation and, in a git repo, the files it changed are restored from a
+snapshot taken when it started.
 
 Env vars:
     AGENT_MODEL           (default: gemma4:12b-it-qat)   — any Ollama model with tool support

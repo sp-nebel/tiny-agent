@@ -10,6 +10,7 @@ from rich.markdown import Markdown
 from rich.markup import escape
 
 import config
+import checkpoint
 from tools import dispatch
 from ollama import call_ollama, warm_cache
 from ui import (read_prompt, fmt_args, truncate, fmt_stats,
@@ -612,6 +613,49 @@ def run_turn(messages, max_steps=20, check_every=20):
                           f"{'s' if stubbed != 1 else ''} from this turn[/dim]")
 
 # --------------------------------------------------------------------------- #
+# Undo
+# --------------------------------------------------------------------------- #
+
+def undo_last_turn(messages, turns):
+    """Rewind the most recent turn: restore the files it changed from its
+    git snapshot, cut its messages off the tail, and return its record (so
+    main can put the prompt back in the input line and restore first_user_msg);
+    None if there is nothing to undo.
+
+    Cache impact: the cut is at the tail, so the retained history is exactly
+    a prefix of what was last sent. A full-attention model keeps that prefix
+    cached; on an SWA model (gemma) rolling back is the same kind of edit as
+    a trim and costs one re-prefill of what remains — paid once, at a moment
+    the user chose, and hidden by the warmup main starts right after.
+    """
+    if not turns:
+        config.console.print("[dim]nothing to undo[/dim]\n")
+        return None
+    rec = turns.pop()
+
+    if rec["snap"] is None:
+        config.console.print("[yellow]not a git repo — conversation rewound, "
+                             "files untouched[/yellow]")
+    else:
+        changes, head_moved = checkpoint.restore(rec["snap"])
+        if changes is None:
+            config.console.print("[yellow]git restore failed — conversation "
+                                 "rewound, files untouched[/yellow]")
+        for status, path in changes or []:
+            verb = "removed" if status == "A" else "restored"
+            config.console.print(f"[dim]{verb} {escape(status)} {escape(path)}[/dim]")
+        if head_moved:
+            config.console.print("[yellow]HEAD moved during that turn; its "
+                                 "commits were kept (files restored only)[/yellow]")
+
+    del messages[rec["msg_index"]:]
+    with contextlib.suppress(OSError):
+        os.chdir(rec["cwd"])
+    config.console.print(f"[dim]undid the last turn ({len(messages)} messages "
+                         f"left); its prompt is back in the input line[/dim]\n")
+    return rec
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -649,6 +693,15 @@ def main():
     messages       = [{"role": "system", "content": config.SYSTEM}]
     first_user_msg = True
     session_name   = None
+    # One record per turn, newest last, for /undo: where the turn's messages
+    # start, its raw prompt, the cwd and first_user_msg it began with, and a
+    # git snapshot of the working tree (None outside a repo). Indices into
+    # `messages`, so anything that replaces the history (/clear, /resume)
+    # empties it.
+    turns          = []
+    # Text pre-filled into the next prompt line — the prompt of an undone
+    # turn, so it can be edited and resent.
+    seed           = ""
 
     def autosave():
         # Skip a system-prompt-only conversation so exits without real work
@@ -693,6 +746,7 @@ def main():
         "hasn't finished. later turns reuse the KV cache. while a reply "
         "streams, just start typing to queue a message for the model; Tab "
         "stops the reply now so you can steer it; Esc cancels the reply. "
+        "'/undo' to take back the last turn (files too, in a git repo), "
         "'/clear' to reset context, '/save', '/resume', "
         "'/sessions' to pause/switch conversations (each takes an optional "
         "name), 'exit' to quit.[/dim]\n"
@@ -705,7 +759,8 @@ def main():
             config.console.print(f"[bold green]you[/bold green] {escape(user)}")
         else:
             try:
-                user = read_prompt("[bold green]you[/bold green] ").strip()
+                user = read_prompt("[bold green]you[/bold green] ", seed).strip()
+                seed = ""
             except (EOFError, KeyboardInterrupt):
                 config.console.print("\nbye")
                 return
@@ -719,6 +774,7 @@ def main():
             # prefill them again. Resetting first_user_msg re-injects the cwd
             # context into the next first user message.
             del messages[1:]
+            del turns[:]
             first_user_msg = True
             config.console.print("[dim]context cleared (system prompt preserved)[/dim]\n")
             continue
@@ -767,18 +823,32 @@ def main():
                 continue
             session_name   = new_name
             first_user_msg = False
+            del turns[:]
             config.console.print(f"[dim]resumed session '{escape(new_name)}' ({len(messages)} messages)[/dim]\n")
             threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
             continue
+        if user.lower() == "/undo":
+            rec = undo_last_turn(messages, turns)
+            if rec:
+                first_user_msg = rec["first"]
+                seed           = rec["prompt"]
+                threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
+            continue
         if not user:
             continue
+
+        # Snapshot before the turn can touch anything. Stat-cached (see
+        # checkpoint._write_tree), so on an unchanged tree it costs a few git
+        # calls, not a re-hash of the repo.
+        turns.append({"msg_index": len(messages), "prompt": user, "first": first_user_msg,
+                      "cwd": os.getcwd(), "snap": checkpoint.snapshot()})
 
         # cwd injected into the FIRST user message only — keeps the system
         # prompt byte-identical across projects so the prefix cache hits every
         # session. Computed here, not once at startup, so a `cd` tool call or
         # a `/clear` (which resets first_user_msg) picks up the current
         # directory instead of whatever it was when the process started.
-        content        = (f"Working directory: {os.getcwd()}\n\n" + user) if first_user_msg else user
+        content       = (f"Working directory: {os.getcwd()}\n\n" + user) if first_user_msg else user
         first_user_msg = False
         messages.append({"role": "user", "content": content})
 

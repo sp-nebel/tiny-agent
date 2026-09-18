@@ -1,6 +1,6 @@
 ---
 name: working-on-tiny-agent
-description: Start-here map for any code change in this repo (tiny-agent). Read before editing any .py file here — covers the master design constraint, module responsibilities, message-history invariants, and code conventions. Applies to agent.py, config.py, ollama.py, tools.py, session.py, ui.py, local_agent.py.
+description: Start-here map for any code change in this repo (tiny-agent). Read before editing any .py file here — covers the master design constraint, module responsibilities, message-history invariants, and code conventions. Applies to agent.py, config.py, ollama.py, tools.py, session.py, checkpoint.py, ui.py, local_agent.py.
 ---
 
 # Working on tiny-agent
@@ -33,7 +33,8 @@ read `verifying-tiny-agent`.
   prefill-sized stall timeout and one retry), `_stub_tool_outputs` (shared stub helper),
   `drop_thinking` and `strip_nudges` (turn-boundary cleanup, invoked from `run_turn`'s
   `finally`, which also stubs the finished turn's oversized tool outputs), `main()` (CLI +
-  REPL with `/clear`, `/save`, `/resume`, `/sessions`).
+  REPL with `/clear`, `/save`, `/resume`, `/sessions`, `/undo`; `undo_last_turn` pops a
+  per-turn record and cuts history back to where that turn began).
 - `ollama.py` — HTTP layer. `_build_payload` is the **single source of truth for request
   bodies**; both call sites (`call_ollama`, `warm_cache`) go through it so
   model/keep_alive/num_ctx can't drift. `call_ollama` streams and returns
@@ -41,6 +42,9 @@ read `verifying-tiny-agent`.
   pump thread (`_iter_with_ticks`) so keys work during silent tool-call composition; any exit
   that abandons a live stream must call `_abort_stream` or Ollama keeps generating.
 - `tools.py` — tool implementations + `dispatch`. Tools return strings and never raise.
+- `checkpoint.py` — git working-tree snapshots for `/undo`, written and restored through a
+  temporary `GIT_INDEX_FILE` so the user's index, HEAD and stash are never touched. Returns
+  `None` outside a repo; never raises.
 - `session.py` — save/resume persistence (`~/.tiny_agent_sessions/`). `apply_session` mutates
   the `messages` list in place (`messages[:] = ...`) so the autosave closure keeps seeing it —
   never rebind that list.

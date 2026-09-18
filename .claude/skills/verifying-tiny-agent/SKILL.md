@@ -12,7 +12,7 @@ behavior warrants it → doc sync. Do the first three always; they need nothing 
 ## 1. Static pass (always)
 
 ```bash
-python3 -m py_compile local_agent.py agent.py config.py ollama.py tools.py session.py ui.py
+python3 -m py_compile local_agent.py agent.py config.py ollama.py tools.py session.py checkpoint.py ui.py
 ```
 
 Silence means success. Also confirm nothing imported a new third-party package — the
@@ -122,6 +122,10 @@ Run `python3 local_agent.py` and exercise:
   unescaped).
 - Ctrl-C while a tool is running — the turn aborts but history stays well-formed
   (stub `[interrupted before this tool ran]` results pair up any pending tool_calls).
+- `/undo` after a turn that edited a file in a git repo — the file is back, a file the turn
+  created is gone, the prompt is pre-filled in the input line, and `git status` / `git diff
+  --cached` look exactly as before the turn. Outside a repo it warns and rewinds only the
+  conversation.
 - A multi-line paste arrives as one prompt, not one prompt per line.
 - Ask for a long file edit: while the tool call is composed silently, the live region shows
   `generating… Ns without visible output` after ~2s and Esc still cancels. The next prompt
