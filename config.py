@@ -51,12 +51,15 @@ STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
 PREFILL_TPS_FALLBACK     = 8.0
 POST_TRIM_TIMEOUT_FACTOR = 2.0
 
-# A refused connection usually means Ollama is mid-restart (e.g. systemd
-# bouncing it back up after an OOM kill, which takes a few seconds). One
-# retry after this delay lets the turn survive that window instead of
-# failing outright; the payload resent is byte-identical, so this has no
-# cache impact beyond what the restart itself already cost.
-RETRY_REFUSED_DELAY = 5
+# Retries for a request that failed before anything streamed: 429/5xx, or a
+# refused/reset connection (usually Ollama mid-restart, e.g. systemd bouncing
+# it back up after an OOM kill, which takes a few seconds). Exponential
+# backoff from RETRY_BASE_DELAY, capped at RETRY_MAX_DELAY, with jitter; a
+# context overflow is never retried. The payload resent is byte-identical,
+# so this has no cache impact beyond what the restart itself already cost.
+RETRY_MAX        = 5
+RETRY_BASE_DELAY = 2
+RETRY_MAX_DELAY  = 30
 
 # Hard cap on any single tool result (grep/read_file/list_dir/find_files), so
 # one call — a long grep context block, a read_file line hitting minified or
