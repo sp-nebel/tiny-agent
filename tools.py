@@ -6,6 +6,7 @@ import difflib
 import subprocess
 
 from rich.text import Text
+from rich.markup import escape
 
 import config
 
@@ -24,7 +25,12 @@ def confirm(msg: str):
     if config.AUTO_YES:
         return True, ""
     try:
-        ans = config.console.input(f"[yellow]{msg}[/yellow] [y/N/reason] ").strip()
+        # Both the message (a path or a shell command can contain brackets)
+        # and the literal hint must be escaped: Rich reads a bracketed run
+        # starting with a lowercase letter as a markup tag and drops an
+        # unknown one silently — "[y/N/reason]" was never displayed.
+        ans = config.console.input(
+            f"[yellow]{escape(msg)}[/yellow] " + escape("[y/N/reason] ")).strip()
     except (EOFError, KeyboardInterrupt):
         return False, ""
     if ans.lower() in ("y", "yes"):

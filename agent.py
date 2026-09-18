@@ -7,6 +7,7 @@ import contextlib
 import urllib.error
 
 from rich.markdown import Markdown
+from rich.markup import escape
 
 import config
 from tools import dispatch
@@ -60,7 +61,7 @@ def deliver_interjections(messages):
         # The echoed `interject` line sits wherever the user happened to type
         # it; print it again here, where it actually enters the conversation —
         # after the tool results of the step it was typed during.
-        config.console.print(f"[bold green]you[/bold green] {text}")
+        config.console.print(f"[bold green]you[/bold green] {escape(text)}")
 
 
 def _msg_tokens(m):
@@ -432,9 +433,13 @@ def run_turn(messages, max_steps=20):
                         except json.JSONDecodeError:
                             args = {}
 
-                    config.console.print(f"[cyan]→ {name}({fmt_args(args)})[/cyan]")
+                    # Rich reads any "[word …]" as a markup tag and drops an
+                    # unknown one silently, so tool args and results — full of
+                    # bracketed metadata like "[lines 1-100 of 543]" — must be
+                    # escaped or the user sees them vanish.
+                    config.console.print(f"[cyan]→ {escape(name)}({escape(fmt_args(args))})[/cyan]")
                     result = dispatch(name, args)
-                    config.console.print(f"[dim]{truncate(result)}[/dim]\n")
+                    config.console.print(f"[dim]{escape(truncate(result))}[/dim]\n")
 
                     # Tool results use role "tool", one message per call.
                     messages.append({"role": "tool", "content": result, "name": name})
@@ -529,7 +534,7 @@ def main():
                 messages[:] = [m for m in messages if not _is_stray_nudge(m)]
                 session_name   = name
                 first_user_msg = False
-                config.console.print(f"[dim]resumed session '{name}' ({len(messages)} messages)[/dim]")
+                config.console.print(f"[dim]resumed session '{escape(name)}' ({len(messages)} messages)[/dim]")
             except (OSError, ValueError, KeyError, TypeError):
                 config.console.print("[yellow]could not read session; starting fresh[/yellow]")
         else:
@@ -546,7 +551,7 @@ def main():
         # first message to `messages` before this thread's request goes out.
         threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
 
-    config.console.print(f"[bold]tiny-agent[/bold] · {config.MODEL} · {os.getcwd()}")
+    config.console.print(f"[bold]tiny-agent[/bold] · {escape(config.MODEL)} · {escape(os.getcwd())}")
     config.console.print(
         "[dim]model warms up in the background; the first reply is slow if it "
         "hasn't finished. later turns reuse the KV cache. while a reply "
@@ -560,7 +565,7 @@ def main():
         if initial:
             user    = initial
             initial = None
-            config.console.print(f"[bold green]you[/bold green] {user}")
+            config.console.print(f"[bold green]you[/bold green] {escape(user)}")
         else:
             try:
                 user = read_prompt("[bold green]you[/bold green] ").strip()
@@ -595,7 +600,7 @@ def main():
                 marker = " [bold]*[/bold]" if name == session_name else ""
                 n        = len(meta.get("messages", []))
                 saved_at = meta.get("saved_at", "?")
-                config.console.print(f"[dim]{name}{marker} — {saved_at} · {n} messages[/dim]")
+                config.console.print(f"[dim]{escape(name)}{marker} — {escape(str(saved_at))} · {n} messages[/dim]")
             config.console.print()
             continue
         if user.lower() == "/save" or user.lower().startswith("/save "):
@@ -603,7 +608,7 @@ def main():
             name = arg_name or session_name or default_ts_name()
             save_session(name, messages)
             session_name = name
-            config.console.print(f"[dim]saved session '{name}'[/dim]\n")
+            config.console.print(f"[dim]saved session '{escape(name)}'[/dim]\n")
             continue
         if user.lower() == "/resume" or user.lower().startswith("/resume "):
             arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
@@ -625,7 +630,7 @@ def main():
                 continue
             session_name   = new_name
             first_user_msg = False
-            config.console.print(f"[dim]resumed session '{new_name}' ({len(messages)} messages)[/dim]\n")
+            config.console.print(f"[dim]resumed session '{escape(new_name)}' ({len(messages)} messages)[/dim]\n")
             threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
             continue
         if not user:
@@ -644,9 +649,9 @@ def main():
             run_turn(messages, max_steps=args.max_steps)
         except urllib.error.HTTPError as e:
             body = getattr(e, "body", "") or e.read().decode(errors="replace")
-            config.console.print(f"[red]Ollama error {e.code}: {body.strip() or e.reason}[/red]")
+            config.console.print(f"[red]Ollama error {e.code}: {escape(body.strip() or str(e.reason))}[/red]")
         except urllib.error.URLError as e:
-            config.console.print(f"[red]cannot reach Ollama at {config.OLLAMA_URL}: {e}[/red]")
+            config.console.print(f"[red]cannot reach Ollama at {escape(config.OLLAMA_URL)}: {escape(str(e))}[/red]")
         except (TimeoutError, OSError) as e:
             # A stalled read mid-stream (see STREAM_TIMEOUT in ollama.py) raises
             # a raw socket timeout here rather than a urllib error, since it
@@ -656,7 +661,7 @@ def main():
                 f"[red]connection to Ollama stalled (no data for "
                 f"{config.STREAM_TIMEOUT}s; the call after a trim pass gets "
                 f"a longer window sized to its re-prefill, and one retry): "
-                f"{e}[/red]"
+                f"{escape(str(e))}[/red]"
             )
         except KeyboardInterrupt:
             config.console.print("\n[yellow]interrupted[/yellow]")
