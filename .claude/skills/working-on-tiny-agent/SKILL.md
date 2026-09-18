@@ -25,7 +25,8 @@ read `verifying-tiny-agent`.
 - `agent.py` — the loop. `run_turn` (one user task: repeated model calls + tool round-trips;
   `deliver_interjections` appends queued typed messages at each step boundary, and
   `_stop_and_steer` commits a Tab-stopped partial reply without its tool_calls, plus the user's
-  note),
+  note; every `check_every` steps it probes the model with `LOOP_CHECK_NUDGE` on a *copy* of the
+  list and ends the turn only on a STUCK verdict),
   `trim_history` (lazy mid-turn context shedding: stubs every already-processed tool output,
   sheds old thinking only as a fallback when that isn't enough, then the hard-truncate
   backstop; returns True when it edited history, which gives the next call a
@@ -58,8 +59,9 @@ non-obvious ways. Any change must preserve:
 3. `thinking` fields exist on assistant messages only *while a turn is live*. Every exit from
    `run_turn` — return, cancel, or exception — passes through its `finally`, which runs
    `drop_thinking` + `strip_nudges`. Don't add an exit path that bypasses it.
-4. Nudges (`STEP_LIMIT_NUDGE`, `EMPTY_RETRY_NUDGE`) and the empty assistant replies that
-   prompt them are transient: stripped at turn end by `strip_nudges`, and filtered again on
+4. Nudges (`STEP_LIMIT_NUDGE`, `EMPTY_RETRY_NUDGE`, the `LOOP_CHECK_PREFIX` probe — never
+   committed on CONTINUE, committed and then stripped on STUCK) and the empty assistant
+   replies that prompt them are transient: stripped at turn end by `strip_nudges`, and filtered again on
    session restore via `_is_stray_nudge` (a crash can persist one into an autosaved session).
    User messages typed mid-turn (`INTERJECTION_PREFIX`, queued) and Tab-stop notes
    (`STOP_NOTE_PREFIX`) are *not* nudges: they are real user input and stay in history. A

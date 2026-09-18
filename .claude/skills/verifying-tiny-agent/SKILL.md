@@ -59,7 +59,9 @@ Needs a running Ollama ≥ 0.20.2 with a tool-capable model pulled (default
 python3 local_agent.py "what does trim_history in agent.py do?" --yes --max-steps 5
 ```
 
-`--yes` skips confirmation prompts so the run is unattended. Expect: cyan `→ tool(...)` lines,
+`--yes` skips confirmation prompts so the run is unattended. To see the loop check fire, run
+with `--max-steps 0 --check-every 3`: a dim `loop check after 3 steps…` line appears, and a
+CONTINUE reply leaves no trace in history (under the default `--max-steps 20` it never fires). Expect: cyan `→ tool(...)` lines,
 a Markdown answer, then a dim stats line.
 
 **Reading the stats line is the cache verification.** It looks like

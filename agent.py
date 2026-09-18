@@ -39,6 +39,22 @@ STEP_LIMIT_NUDGE = (
 EMPTY_RETRY_NUDGE = "[your last reply was empty — please continue.]"
 MAX_EMPTY_RETRIES = 2
 
+# Asked every check_every tool steps, at the tail of a *copy* of the message
+# list. On CONTINUE nothing is committed: the next real call simply diverges
+# from the probe at the tail, which costs the server those few tokens and no
+# cache bust (on an SWA model, one checkpoint restore). On STUCK the probe
+# and the reply are committed so the turn can end on the model's own
+# explanation; _is_stray_nudge matches the prefix and strips the question at
+# turn end, leaving the explanation as the final message. One-word verdict
+# first, because small models bury a yes/no in prose.
+LOOP_CHECK_PREFIX = "[checkpoint: "
+LOOP_CHECK_NUDGE  = (
+    LOOP_CHECK_PREFIX + "you have taken {n} tool steps on this task. Look at your "
+    "recent steps. If they repeat the same actions without producing new "
+    "information, reply with the single word STUCK followed by one sentence on "
+    "what you tried. Otherwise reply with the single word CONTINUE and nothing else.]"
+)
+
 # Marks a message the user typed while the model was mid-task (see
 # ui.read_interjection), so the model reads it as a new instruction arriving
 # during the work rather than as a fresh, unrelated task. Same shape as the
@@ -329,7 +345,7 @@ def drop_thinking(messages, start):
 
 
 def _is_stray_nudge(m):
-    """A step-limit/empty-retry nudge, or the empty assistant reply that
+    """A step-limit/empty-retry/loop-check nudge, or the empty assistant reply that
     prompted one — the pieces strip_nudges removes once a turn ends. Exposed
     separately so a restored session (main()'s apply_session call sites) can
     run the same filter: a turn interrupted before strip_nudges ran (a
@@ -337,7 +353,8 @@ def _is_stray_nudge(m):
     one of these into an autosaved session, and it would otherwise sit there
     forever.
     """
-    if m.get("role") == "user" and m.get("content") in (STEP_LIMIT_NUDGE, EMPTY_RETRY_NUDGE):
+    if m.get("role") == "user" and (m.get("content") in (STEP_LIMIT_NUDGE, EMPTY_RETRY_NUDGE)
+                                     or (m.get("content") or "").startswith(LOOP_CHECK_PREFIX)):
         return True
     if (m.get("role") == "assistant" and not (m.get("content") or "").strip()
             and not m.get("tool_calls")):
@@ -359,14 +376,34 @@ def strip_nudges(messages, start):
     messages[:] = keep
 
 
-def run_turn(messages, max_steps=20):
+def _says_stuck(content):
+    # The probe asks for the verdict word first; tolerate the markdown or
+    # punctuation a model may wrap it in, but don't search the whole reply —
+    # "CONTINUE, I'm not stuck" must not read as STUCK.
+    return (content or "").strip().lstrip("*#-> ").upper().startswith("STUCK")
+
+
+def _add_stats(turn_stats, stats):
+    for k, v in stats.items():
+        turn_stats[k] = turn_stats.get(k, 0) + v
+    _note_prefill_rate(stats)
+
+
+def run_turn(messages, max_steps=20, check_every=20):
     # max_steps <= 0 means unlimited: no forced final step, no nudge.
+    # check_every > 0 asks the model every that many tool steps whether it is
+    # looping (see LOOP_CHECK_NUDGE); a STUCK verdict ends the turn on its
+    # explanation, anything else lets it keep working with a fresh budget.
+    # Under the default max_steps=20 a 20-step check can never fire (the
+    # counter reaches 20 only as the loop exits); it is for max_steps=0 or a
+    # higher cap, where nothing else would stop a model going in circles.
     # A turn fans out into several call_ollama requests (one per tool
     # round-trip); sum their stats and print one summary line when the turn
     # finishes, rather than a line per call.
     turn_stats = {}
     calls = 0
     step = 0
+    since_check = 0
     empty_retries = 0
     # Where this turn's messages begin, so drop_thinking/strip_nudges can find
     # them at the end and clean up what was fed back across the turn's tool
@@ -381,6 +418,48 @@ def run_turn(messages, max_steps=20):
             # the whole prefill) and instead append a nudge at the *tail* — only its
             # own tokens prefill, so the prefix cache stays intact.
             last = max_steps > 0 and step == max_steps - 1
+
+            # Loop check, after the trim so the probe never goes out over the
+            # threshold, and never on the forced last step — the nudge below
+            # already ends the turn there.
+            if check_every > 0 and since_check >= check_every and not last:
+                since_check = 0
+                config.console.print(f"[dim]loop check after {step} steps…[/dim]")
+                probe = messages + [{"role": "user",
+                                     "content": LOOP_CHECK_NUDGE.format(n=step)}]
+                # If a trim just busted the cache, the probe is the call that
+                # pays the silent re-prefill, so it takes the long timeout;
+                # the main call below then reuses that prefix normally.
+                timeout = _post_trim_timeout(messages) if trimmed else None
+                content, thinking, tool_calls, cancelled, interrupted, stats = call_ollama(
+                    probe, timeout=timeout, retry_stall=trimmed)
+                trimmed = False
+                if cancelled:
+                    config.console.print("[yellow]cancelled[/yellow]")
+                    return
+                if stats:
+                    calls += 1
+                    _add_stats(turn_stats, stats)
+                if interrupted:
+                    # A partial answer to a discarded probe means nothing to
+                    # the model; commit only the user's note.
+                    _stop_and_steer(messages, "", "")
+                    continue
+                if _says_stuck(content) and not tool_calls:
+                    # Commit the exchange so the turn ends on the model's own
+                    # account of what it tried; the user gets control back
+                    # with the whole turn still in context to steer from.
+                    messages.append(probe[-1])
+                    messages.append({"role": "assistant", "content": content})
+                    config.console.print("[yellow]model reports it is stuck after "
+                                         f"{step} steps — handing back to you[/yellow]")
+                    config.console.print(Markdown(content))
+                    if turn_stats:
+                        config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
+                    return
+                # CONTINUE, a tool call, or anything else: the probe is
+                # discarded and work goes on with a fresh budget.
+
             # A Tab-steer on the last step re-enters here without consuming
             # the step; the nudge already sent stays in force, so don't stack
             # a second copy after the user's note.
@@ -412,9 +491,7 @@ def run_turn(messages, max_steps=20):
 
             if stats:
                 calls += 1
-                for k, v in stats.items():
-                    turn_stats[k] = turn_stats.get(k, 0) + v
-                _note_prefill_rate(stats)
+                _add_stats(turn_stats, stats)
 
             # On the forced final step we treat the reply as the answer and drop any
             # tool_calls it may still carry: we're out of budget, and storing
@@ -508,6 +585,7 @@ def run_turn(messages, max_steps=20):
             # empties across a long turn don't accumulate toward the cap.
             empty_retries = 0
             step += 1
+            since_check += 1
     finally:
         # Every exit from this function — normal return, a cancelled stream,
         # or an exception (a stalled connection, an HTTP error) propagating
@@ -543,6 +621,9 @@ def main():
     ap.add_argument("--model",     default=None,   help=f"Ollama model tag (default: {config.MODEL}, or the saved model when resuming)")
     ap.add_argument("--yes",       action="store_true", help="auto-approve writes and commands")
     ap.add_argument("--max-steps", type=int, default=20, help="max tool calls per task (0 = unlimited)")
+    ap.add_argument("--check-every", type=int, default=20,
+                    help="every N tool round-trips, ask the model whether it is looping and "
+                         "stop if it says so (0 = never; inert under the default --max-steps)")
     ap.add_argument("--resume",    nargs="?", const="", default=None,
                      help="resume a saved session by name; bare --resume resumes the most recent")
     args = ap.parse_args()
@@ -702,7 +783,7 @@ def main():
         messages.append({"role": "user", "content": content})
 
         try:
-            run_turn(messages, max_steps=args.max_steps)
+            run_turn(messages, max_steps=args.max_steps, check_every=args.check_every)
         except urllib.error.HTTPError as e:
             body = getattr(e, "body", "") or e.read().decode(errors="replace")
             config.console.print(f"[red]Ollama error {e.code}: {escape(body.strip() or str(e.reason))}[/red]")

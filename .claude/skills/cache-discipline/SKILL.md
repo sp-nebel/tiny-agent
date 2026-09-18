@@ -33,6 +33,11 @@ state its cache impact.** If you can't state it, you don't understand the change
      every byte after that point) and nudges via the tail instead.
    - `thinking` is *carried forward* on appended assistant messages during a turn rather than
      re-sent some other way.
+   - The loop-check probe (`LOOP_CHECK_NUDGE`) is sent on a *copy* of the list and committed
+     only on STUCK; the next real request diverges from it at the tail, so the cached prefix
+     up to the last committed message is untouched (an SWA model pays one checkpoint restore).
+   - Queued interjections and Tab-stop notes are user messages appended at the tail, never
+     spliced in between an assistant `tool_calls` message and its results.
 
 3. **Cache busts are only allowed at already-expensive, bounded moments:**
    - `trim_history`: once per pass, only when the estimate crosses `TRIM_AT_TOKENS`. It
