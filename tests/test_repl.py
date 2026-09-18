@@ -12,6 +12,13 @@ import ui
 from agent import SHELL_BLOCK_HEAD, run_shell_escape
 
 
+def header(path, repo=False):
+    """The first message's context lines for `path` (a repo root if `repo`)."""
+    git = f"yes, root {path}" if repo else "no"
+    return (f"Working directory: {path}\nGit repo: {git} · Platform: {agent.sys.platform} · "
+            f"Date: {agent.time.strftime('%Y-%m-%d')}")
+
+
 class Repl:
     """Feeds `inputs` to main() as typed prompts and records what each turn
     was handed. The seed read_prompt was given for each prompt is recorded
@@ -57,7 +64,7 @@ def test_bang_output_rides_with_the_next_prompt(monkeypatch, tmp_path):
     r = Repl(monkeypatch, ["!echo hello", "what did it print?", "next"]).run()
     first = r.turns[0]
     block = SHELL_BLOCK_HEAD.format(cmd="echo hello", status="exit 0") + "\nhello"
-    assert first == f"Working directory: {tmp_path}\n\n{block}\n\nwhat did it print?"
+    assert first == f"{header(tmp_path)}\n\n{block}\n\nwhat did it print?"
     assert r.turns[1] == "next"            # consumed by the turn, not resent
 
 
@@ -100,13 +107,13 @@ def test_undo_rewinds_and_prefills_the_prompt(monkeypatch, tmp_path):
     assert not (tmp_path / "made.txt").exists()
     assert r.seeds[3] == "two"             # the prompt read right after /undo
     assert [m["content"] for m in r.messages[1:]] == [
-        f"Working directory: {tmp_path}\n\none", "ok", "two again", "ok"]
+        f"{header(tmp_path, repo=True)}\n\none", "ok", "two again", "ok"]
 
 
 def test_undoing_the_first_turn_reinjects_the_cwd(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     r = Repl(monkeypatch, ["one", "/undo", "one again"]).run()
-    assert r.turns[1] == f"Working directory: {tmp_path}\n\none again"
+    assert r.turns[1] == f"{header(tmp_path)}\n\none again"
 
 
 def test_file_ref_is_attached_but_prompt_seed_stays_raw(monkeypatch, tmp_path):

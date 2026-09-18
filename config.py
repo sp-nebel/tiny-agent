@@ -115,6 +115,16 @@ except ValueError:
     SYNTAX_CHECK_CMDS = {}
 SYNTAX_CHECK_TIMEOUT = 20
 
+# Instructions files put into the first user message: the global one, then
+# the first of INSTRUCTION_FILES found walking up from the cwd to the git
+# root. Each is cut at INSTRUCTIONS_MAX_CHARS — it rides in every request of
+# the conversation.
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                          "tiny-agent")
+GLOBAL_INSTRUCTIONS    = os.path.join(CONFIG_DIR, "AGENTS.md")
+INSTRUCTION_FILES      = ("AGENTS.md", "CLAUDE.md")
+INSTRUCTIONS_MAX_CHARS = 3000
+
 # Directories never worth walking in a glob.
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv",
              ".mypy_cache", ".pytest_cache", ".ruff_cache"}

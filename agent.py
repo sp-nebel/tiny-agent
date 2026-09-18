@@ -1,6 +1,8 @@
 import os
 import re
+import sys
 import json
+import time
 import atexit
 import argparse
 import threading
@@ -650,6 +652,87 @@ def run_turn(messages, max_steps=20, check_every=20):
                           f"{'s' if stubbed != 1 else ''} from this turn[/dim]")
 
 # --------------------------------------------------------------------------- #
+# First-message context
+# --------------------------------------------------------------------------- #
+
+# Leads an instructions file's text in the first user message. Imperative,
+# like the other bracketed lead-ins: a small model treats unlabelled text as
+# something to comment on, not rules to work by.
+INSTRUCTIONS_HEAD = "[instructions from {path}; follow them while you work]"
+
+
+def _git_root(start):
+    """The nearest enclosing directory with a .git entry, or None. A plain
+    walk instead of `git rev-parse`: this runs before every first message
+    and must not depend on git being installed."""
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def find_instructions(start):
+    """The project instructions file for `start`: the first of
+    config.INSTRUCTION_FILES found walking up from `start` to the git root.
+    Outside a repo only `start` itself is looked at — walking up to / would
+    pick up whatever happens to sit in a parent directory."""
+    d    = os.path.abspath(start)
+    root = _git_root(d)
+    while True:
+        for name in config.INSTRUCTION_FILES:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                return path
+        if root is None or d == root:
+            return None
+        d = os.path.dirname(d)
+
+
+def _instructions_block(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    cap = config.INSTRUCTIONS_MAX_CHARS
+    if len(text) > cap:
+        text = (text[:cap] + f"\n[… cut at {cap} chars; read_file {path} "
+                f"with start=1 for the rest]")
+    return INSTRUCTIONS_HEAD.format(path=path) + "\n" + text
+
+
+def context_header():
+    """What the first user message of a conversation opens with: the cwd,
+    whether it is a git repo, platform and date, then the global and the
+    project instructions files, if any.
+
+    Lives in the first user message, never in SYSTEM, so the cached static
+    prefix stays byte-identical across projects and days. Read again at
+    each /clear, so an edited AGENTS.md takes effect from the next
+    conversation; a running one keeps what it was sent (rewriting the
+    first message would bust the whole cache).
+    """
+    cwd  = os.getcwd()
+    root = _git_root(cwd)
+    env  = (f"Working directory: {cwd}\n"
+            f"Git repo: {('yes, root ' + root) if root else 'no'} · "
+            f"Platform: {sys.platform} · Date: {time.strftime('%Y-%m-%d')}")
+    blocks = [env]
+    project = find_instructions(cwd)
+    for path in (config.GLOBAL_INSTRUCTIONS, project):
+        block = path and os.path.isfile(path) and _instructions_block(path)
+        if block:
+            blocks.append(block)
+            config.console.print(f"[dim]instructions from {escape(path)}[/dim]")
+    return "\n\n".join(blocks)
+
+# --------------------------------------------------------------------------- #
 # Prompt expansions
 # --------------------------------------------------------------------------- #
 
@@ -985,13 +1068,14 @@ def main():
         turns.append({"msg_index": len(messages), "prompt": user, "first": first_user_msg,
                       "cwd": os.getcwd(), "snap": checkpoint.snapshot()})
 
-        # cwd injected into the FIRST user message only — keeps the system
-        # prompt byte-identical across projects so the prefix cache hits every
-        # session. Computed here, not once at startup, so a `cd` tool call or
-        # a `/clear` (which resets first_user_msg) picks up the current
-        # directory instead of whatever it was when the process started.
+        # cwd and instructions injected into the FIRST user message only —
+        # keeps the system prompt byte-identical across projects so the
+        # prefix cache hits every session. Computed here, not once at
+        # startup, so a `cd` tool call or a `/clear` (which resets
+        # first_user_msg) picks up the current directory instead of whatever
+        # it was when the process started.
         content        = "\n\n".join(pending_shell + [expand_file_refs(user)])
-        content        = (f"Working directory: {os.getcwd()}\n\n" + content) if first_user_msg else content
+        content        = (context_header() + "\n\n" + content) if first_user_msg else content
         del pending_shell[:]
         first_user_msg = False
         messages.append({"role": "user", "content": content})
