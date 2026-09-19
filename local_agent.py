@@ -28,6 +28,10 @@ Design decisions (the "why" behind the code):
 Usage:
     python local_agent.py "review the null handling in AuthService"
     python local_agent.py            # interactive; seed a task at the prompt
+    git diff | python local_agent.py "review this" > review.md
+                                     # one turn on piped input; only the answer on stdout
+    python local_agent.py -c                 # resume the most recent session
+    python local_agent.py --resume NAME      # resume a named session
     python local_agent.py --max-steps 0 --check-every 10
                                      # no step cap; every 10 steps ask the model
                                      # whether it is looping, stop if it says so
@@ -41,14 +45,18 @@ bare refusal. `/undo` takes back the last turn: its messages leave the
 conversation and, in a git repo, the files it changed are restored from a
 snapshot taken when it started. At the prompt, `!cmd` runs a shell command
 and sends its output to the model with your next message; `!!cmd` only
-shows it to you. `@path` in a prompt attaches that file's contents, and a
-line ending in `\\` continues onto the next.
+shows it to you. `@path` in a prompt attaches that file's contents
+(`@path#10-40` just those lines), and a line ending in `\\` continues onto
+the next. `/help` lists every command, including custom ones from
+`.tiny-agent/commands/*.md` and `~/.config/tiny-agent/commands/*.md`.
 
 Env vars:
     AGENT_MODEL           (default: gemma4:12b-it-qat)   — any Ollama model with tool support
     OLLAMA_URL            (default: http://localhost:11434)
     AGENT_THINK           (default: 1) — set to 0 to disable reasoning output
     AGENT_NUM_CTX         (default: 24576) — Ollama context window size; lower on memory-constrained machines
+    AGENT_NOTIFY          (default: 1) — set to 0 to disable the bell/desktop notification after long turns
+    AGENT_SYNTAX_CHECKS   (default: none) — JSON {".ext": "command {path}"} syntax checks run after an edit
     AGENT_STREAM_TIMEOUT  (default: 300) — per-read socket timeout (s) on streaming calls; the call right
                           after a trim pass instead gets a timeout sized to its full re-prefill
 

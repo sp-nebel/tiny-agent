@@ -1,4 +1,7 @@
+import os
+import re
 import sys
+import time
 import select
 import contextlib
 
@@ -234,6 +237,45 @@ def read_interjection(live, seed="", repaint=None):
     return text
 
 
+# --------------------------------------------------------------------------- #
+# Attention: bell / desktop notification
+# --------------------------------------------------------------------------- #
+
+_turn_started = None
+
+
+def mark_turn_start():
+    global _turn_started
+    _turn_started = time.monotonic()
+
+
+def turn_elapsed():
+    return time.monotonic() - _turn_started if _turn_started else 0.0
+
+
+def notify(message):
+    """Ring the bell and raise a desktop notification — only once the turn
+    has run long enough (NOTIFY_AFTER) that the user has likely looked away,
+    so a quick answer doesn't ping every time.
+
+    OSC 777 is what VTE terminals (GNOME Terminal, Tilix) show as a desktop
+    notification; OSC 9 is the iTerm2/kitty/WezTerm/Windows Terminal form.
+    Only one is sent, since a terminal that knows both would show it twice.
+    Terminals that know neither ignore the sequence, and the bell alone
+    still marks the tab.
+    """
+    if not config.NOTIFY or not sys.stdout.isatty():
+        return
+    if turn_elapsed() < config.NOTIFY_AFTER:
+        return
+    text = message.replace("\x1b", "").replace("\x07", "").replace(";", ",")
+    if os.environ.get("VTE_VERSION"):
+        seq = f"\x1b]777;notify;tiny-agent;{text}\x07"
+    else:
+        seq = f"\x1b]9;tiny-agent: {text}\x07"
+    sys.stdout.write("\a" + seq)
+    sys.stdout.flush()
+
 # How long nothing may stream before the live view explains the silence.
 QUIET_NOTICE_AFTER = 2
 
@@ -258,12 +300,21 @@ def _render_stream(thinking: str, content: str, quiet_s: float = 0.0) -> Text:
     terminal height ourselves — answer in full, plus as many of the most recent
     thinking lines as fit above it — so the live tail is always what you see.
     """
-    quiet = quiet_s >= QUIET_NOTICE_AFTER
-    # The notice sits at the bottom, which is exactly where Live crops an
-    # over-tall region — reserve its rows (blank separator + one line)
-    # rather than let it be the first thing cut.
-    avail = max(4, config.console.size.height - 2 - (2 if quiet else 0))
+    quiet  = quiet_s >= QUIET_NOTICE_AFTER
+    queued = len(_interjections)
+    # The notices sit at the bottom, which is exactly where Live crops an
+    # over-tall region — reserve their rows (blank separator + one line
+    # each) rather than let them be the first thing cut.
+    avail = max(4, config.console.size.height - 2 - (2 if quiet else 0)
+                - (2 if queued else 0))
     out   = Text()
+    if not config.SHOW_THINKING and thinking:
+        # /thinking only hides the display; the model still thinks, and the
+        # `think` request flag is untouched (flipping it would render a
+        # different prompt template and cost the cache). One line keeps the
+        # sign of life that thinking was there for.
+        n        = len(thinking.split())
+        thinking = f"(thinking hidden — {n} words so far; /thinking shows it)"
 
     content_lines = content.splitlines() if content else []
     # Reserve rows for the answer; the rest is the reasoning window. -2 leaves
@@ -289,6 +340,11 @@ def _render_stream(thinking: str, content: str, quiet_s: float = 0.0) -> Text:
         out.append(f"generating… {quiet_s:.0f}s without visible output (a tool call "
                    f"arrives whole once it is finished). Esc cancels, Tab stops "
                    f"to steer, typing queues a message.", style="dim italic")
+    if queued:
+        if thinking or content or quiet:
+            out.append("\n\n")
+        out.append(f"({queued} message{'s' if queued != 1 else ''} queued for the "
+                   f"model after this step)", style="dim italic")
     return out
 
 # --------------------------------------------------------------------------- #
@@ -315,7 +371,7 @@ def truncate(text: str, n: int = 600) -> str:
     return text if len(text) <= n else text[:n] + f"\n… (~{approx_tokens(text)} tokens total)"
 
 
-def fmt_stats(stats: dict, calls: int) -> str:
+def fmt_stats(stats: dict, calls: int, elapsed=None, ctx_pct=None) -> str:
     """One-line summary of a whole turn, summed across its `calls` LLM calls.
 
     A turn fans out into several call_ollama requests (one per tool round-trip),
@@ -323,6 +379,11 @@ def fmt_stats(stats: dict, calls: int) -> str:
     turn — the first call dominates it, since later calls reuse the KV prefix
     cache and only prefill the new tool results — and the rate is the
     token-weighted gen tok/s (summed eval_count over summed eval_duration).
+
+    `elapsed` is the whole turn's wall time — tools and confirmation waits
+    included, which the model timings leave out — and `ctx_pct` the share of
+    NUM_CTX the history now estimates at, so a coming trim (at 70%) is
+    visible before it happens.
     """
     p_tok = stats.get("prompt_eval_count", 0)
     p_dur = stats.get("prompt_eval_duration", 0) / 1e9
@@ -330,4 +391,102 @@ def fmt_stats(stats: dict, calls: int) -> str:
     g_dur = stats.get("eval_duration", 0) / 1e9
     rate  = f"{g_tok / g_dur:.1f} tok/s" if g_dur else "—"
     prefix = f"{calls} steps · " if calls > 1 else ""
-    return f"{prefix}prefill {p_tok} tok in {p_dur:.1f}s · gen {g_tok} tok @ {rate}"
+    line   = f"{prefix}prefill {p_tok} tok in {p_dur:.1f}s · gen {g_tok} tok @ {rate}"
+    if elapsed is not None:
+        line += f" · {_fmt_duration(elapsed)} total"
+    if ctx_pct is not None:
+        line += f" · ctx ~{ctx_pct}%"
+    return line
+
+
+def _fmt_duration(s):
+    s = int(round(s))
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+# --------------------------------------------------------------------------- #
+# Tool-call display
+# --------------------------------------------------------------------------- #
+
+# A result that starts like one of these is a failure; its body is shown
+# even with /details off, since that is when the user wants to see it.
+_FAIL_PREFIXES = ("[no such", "[error", "[bad args", "[unknown tool", "[tool error",
+                  "[old_string", "[grep error", "[grep timed out", "[binary",
+                  "[invalid range", "[start=", "[not a directory", "[user declined",
+                  "[could not start")
+
+
+def tool_failed(name, result):
+    if result.startswith(_FAIL_PREFIXES) or "\n[warning:" in result:
+        return True
+    if " is a directory, not a file]" in result.split("\n", 1)[0]:
+        return name != "read_file"          # read_file answers with a listing
+    if name == "run_cmd":
+        m = re.search(r"\[exit (\d+)(?:, no output)?\]$", result)
+        if m:
+            return m.group(1) != "0"
+        return "[timed out after" in result or "[the user stopped" in result
+    return False
+
+
+def _q(s, n=40):
+    s = str(s)
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def tool_call_label(name, args):
+    """The call in a few words: `read agent.py:10-40`, `grep "foo" in src`."""
+    a = args if isinstance(args, dict) else {}
+    if name == "read_file":
+        rng = ""
+        if a.get("start") or a.get("end"):
+            rng = f":{a.get('start') or 1}-{a.get('end') or ''}"
+        return f"read {_q(a.get('path', '?'), 60)}{rng}"
+    if name == "grep":
+        where = f" in {_q(a['path'])}" if a.get("path") not in (None, ".", "") else ""
+        inc   = f" ({_q(a['include'])})" if a.get("include") else ""
+        return f'grep "{_q(a.get("pattern", ""))}"{where}{inc}'
+    if name == "find_files":
+        return f'find_files "{_q(a.get("pattern", ""))}"'
+    if name in ("list_dir", "cd"):
+        return f"{name} {_q(a.get('path', '.'), 60)}"
+    if name == "run_cmd":
+        return f"run_cmd {_q(a.get('cmd', ''), 80)}"
+    if name in ("edit_file", "append_file"):
+        return f"{name} {_q(a.get('path', '?'), 60)}"
+    return f"{name}({fmt_args(a)})"
+
+
+def tool_outcome(name, result):
+    """A few words on what came back, for the end of the call line."""
+    first = result.split("\n", 1)[0]
+    if name == "read_file":
+        # Not necessarily the first line: a latin-1 file's note comes first.
+        m = re.search(r"^\[lines (\d+-\d+ of \d+)", result, re.M)
+        if m:
+            return m.group(1)
+        m = re.search(r"\[end of file, (\d+) lines?\]$", result)
+        return (f"{m.group(1)} line{'s' if m.group(1) != '1' else ''} to the end" if m else "")
+    if name == "grep":
+        if result == "[no matches]":
+            return "no matches"
+        n    = len(re.findall(r"^\d+:", result, re.M))
+        more = re.search(r"\[\+(\d+) more matches", result)
+        n   += int(more.group(1)) if more else 0
+        return f"{n} match{'es' if n != 1 else ''}"
+    if name in ("find_files", "list_dir"):
+        if result.startswith("[no matches]") or result.startswith("[empty"):
+            return "none"
+        lines = result.split("\n")
+        n     = sum(1 for l in lines if l and not l.startswith("["))
+        more  = re.search(r"\[\+(\d+) more\]", result)
+        n    += int(more.group(1)) if more else 0
+        return f"{n} entr{'ies' if n != 1 else 'y'}" if name == "list_dir" else f"{n} found"
+    if name == "run_cmd":
+        m = re.search(r"\[exit (\d+)(?:, no output)?\]$", result)
+        if m:
+            return f"exit {m.group(1)}"
+        if "[timed out after" in result:
+            return "timed out"
+        return "exit 0"
+    return ""
+

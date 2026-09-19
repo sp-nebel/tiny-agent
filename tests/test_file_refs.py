@@ -10,7 +10,7 @@ def test_existing_file_is_attached(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "a.py").write_text("x = 1\n")
     out = expand_file_refs("explain @a.py")
-    assert out == "explain @a.py\n\n" + block("a.py", "    1  x = 1\n")
+    assert out == "explain @a.py\n\n" + block("a.py", "    1  x = 1\n[end of file, 1 line]")
 
 
 def test_non_files_are_left_alone(tmp_path, monkeypatch):

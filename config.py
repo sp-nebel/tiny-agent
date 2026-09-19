@@ -1,4 +1,5 @@
 import os
+import json
 
 from rich.console import Console
 
@@ -13,10 +14,16 @@ SESSION_DIR = os.path.expanduser("~/.tiny_agent_sessions")
 
 MAX_READ_LINES = 100
 MAX_GREP_HITS  = 20
+GREP_MAX_LINE_CHARS = 300
 MAX_GLOB_HITS  = 20
 MAX_LIST_HITS  = 200
+# Files looked at for a "did you mean" when a path doesn't exist.
+SIMILAR_PATHS_SCAN = 5000
 MAX_CMD_CHARS  = 8000
 CMD_TIMEOUT    = 120
+# Ceiling on run_cmd's per-call timeout parameter — under --yes the model's
+# own number would otherwise be the only limit.
+MAX_CMD_TIMEOUT = 600
 
 # Ollama's host-memory prompt-cache saves (and, for SWA models, per-checkpoint
 # state) scale with resident context tokens. On memory-constrained boxes a
@@ -44,12 +51,15 @@ STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
 PREFILL_TPS_FALLBACK     = 8.0
 POST_TRIM_TIMEOUT_FACTOR = 2.0
 
-# A refused connection usually means Ollama is mid-restart (e.g. systemd
-# bouncing it back up after an OOM kill, which takes a few seconds). One
-# retry after this delay lets the turn survive that window instead of
-# failing outright; the payload resent is byte-identical, so this has no
-# cache impact beyond what the restart itself already cost.
-RETRY_REFUSED_DELAY = 5
+# Retries for a request that failed before anything streamed: 429/5xx, or a
+# refused/reset connection (usually Ollama mid-restart, e.g. systemd bouncing
+# it back up after an OOM kill, which takes a few seconds). Exponential
+# backoff from RETRY_BASE_DELAY, capped at RETRY_MAX_DELAY, with jitter; a
+# context overflow is never retried. The payload resent is byte-identical,
+# so this has no cache impact beyond what the restart itself already cost.
+RETRY_MAX        = 5
+RETRY_BASE_DELAY = 2
+RETRY_MAX_DELAY  = 30
 
 # Hard cap on any single tool result (grep/read_file/list_dir/find_files), so
 # one call — a long grep context block, a read_file line hitting minified or
@@ -97,15 +107,59 @@ KEEP_RECENT_MESSAGES    = 6
 # later pass would re-edit it, destroying the original "was N chars" figure.
 TRIM_PREFIX        = "[«compacted» "
 
+# Syntax check after edit_file/append_file writes a file, reported as one
+# line in the tool result — a light stand-in for an LSP. .py (ast) and
+# .json are built in; more extensions via a JSON object of shell commands
+# with {path} as the placeholder, e.g.
+#   AGENT_SYNTAX_CHECKS='{".js": "node --check {path}", ".sh": "bash -n {path}"}'
+try:
+    SYNTAX_CHECK_CMDS = json.loads(os.environ.get("AGENT_SYNTAX_CHECKS", "{}"))
+except ValueError:
+    SYNTAX_CHECK_CMDS = {}
+SYNTAX_CHECK_TIMEOUT = 20
+
+# Instructions files put into the first user message: the global one, then
+# the first of INSTRUCTION_FILES found walking up from the cwd to the git
+# root. Each is cut at INSTRUCTIONS_MAX_CHARS — it rides in every request of
+# the conversation.
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                          "tiny-agent")
+GLOBAL_INSTRUCTIONS    = os.path.join(CONFIG_DIR, "AGENTS.md")
+INSTRUCTION_FILES      = ("AGENTS.md", "CLAUDE.md")
+INSTRUCTIONS_MAX_CHARS = 3000
+
 # Directories never worth walking in a glob.
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv",
              ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 
+# The same tool call returning the same result this many times in a row in
+# one turn gets a "stop repeating this" note appended to its result.
+REPEAT_CALL_LIMIT = 3
+
 AUTO_YES = False
+# False when stdin is piped: confirm() can't ask, so it refuses (unless
+# AUTO_YES). ANSWER_TO_STDOUT is set when stdout is piped too: only the
+# final answer goes there, and the console writes to stderr.
+INTERACTIVE      = True
+ANSWER_TO_STDOUT = False
+# Cap on text piped in on stdin; the rest is saved to a file like any
+# oversized tool output, and the notice gives its path.
+MAX_PIPED_CHARS  = 16000
 # Ask the model to emit reasoning in a separate `thinking` field. Streamed
 # live as feedback on slow CPU runs, then discarded once the answer lands.
 # Auto-disabled at runtime if the model doesn't support thinking.
 THINK = os.environ.get("AGENT_THINK", "1") not in ("0", "false", "")
+
+# Bell + desktop notification when a turn ends or a confirmation waits,
+# once the turn has run at least NOTIFY_AFTER seconds. AGENT_NOTIFY=0 turns
+# it off.
+NOTIFY       = os.environ.get("AGENT_NOTIFY", "1") not in ("0", "false", "")
+NOTIFY_AFTER = 20
+
+# Display toggles, flipped by /details and /thinking. Neither changes what
+# the model is sent.
+SHOW_DETAILS  = False   # full tool results under each call, not just failures
+SHOW_THINKING = True    # the live reasoning view while a reply streams
 
 console = Console()
 
@@ -142,12 +196,13 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search for a regex pattern in a file or directory tree. Returns matching lines with file path and line number.",
+            "description": "Search for a regex pattern in a file or directory tree. Returns matching lines grouped by file, each as line number and text.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string",  "description": "Search pattern (regex)"},
                     "path":    {"type": "string",  "description": "File or directory to search (default '.')"},
+                    "include": {"type": "string",  "description": "Only search files whose name matches this glob, e.g. '*.py'"},
                     "context": {"type": "integer", "description": "Show N lines of context before AND after each match (-C)"},
                     "before":  {"type": "integer", "description": "Show N lines before each match (-B); ignored if context is set"},
                     "after":   {"type": "integer", "description": "Show N lines after each match (-A); ignored if context is set"},
@@ -284,7 +339,8 @@ TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "cmd": {"type": "string", "description": "Shell command to run"},
+                    "cmd":     {"type": "string",  "description": "Shell command to run"},
+                    "timeout": {"type": "integer", "description": "Seconds before the command is killed (default 120, max 600)"},
                 },
                 "required": ["cmd"],
             },

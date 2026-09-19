@@ -54,7 +54,7 @@ def test_continuation_recovers_the_rest_of_the_file(tmp_path, monkeypatch):
             # Last call: no notice, remaining lines returned in full.
             for ln in result.splitlines():
                 stripped = ln.strip()
-                if stripped:
+                if stripped and not stripped.startswith("["):
                     n = int(ln[:5])
                     seen.add(n)
             break

@@ -12,6 +12,13 @@ import ui
 from agent import SHELL_BLOCK_HEAD, run_shell_escape
 
 
+def header(path, repo=False):
+    """The first message's context lines for `path` (a repo root if `repo`)."""
+    git = f"yes, root {path}" if repo else "no"
+    return (f"Working directory: {path}\nGit repo: {git} · Platform: {agent.sys.platform} · "
+            f"Date: {agent.time.strftime('%Y-%m-%d')}")
+
+
 class Repl:
     """Feeds `inputs` to main() as typed prompts and records what each turn
     was handed. The seed read_prompt was given for each prompt is recorded
@@ -46,10 +53,27 @@ class Repl:
         monkeypatch.setattr(agent.atexit, "register", lambda *a, **k: None)
         monkeypatch.setattr(agent, "readline", None)
         monkeypatch.setattr("sys.argv", ["local_agent.py"])
+        # A terminal, as far as main() can tell: pytest's own stdin isn't
+        # one, and a non-tty stdin switches main() into piped one-shot mode.
+        monkeypatch.setattr("sys.stdin", FakeTTY(""))
 
     def run(self):
         agent.main()
         return self
+
+
+class FakeTTY:
+    """stdin stand-in: a terminal by default, or a pipe holding `text`."""
+
+    def __init__(self, text, tty=True):
+        self.text, self.tty = text, tty
+
+    def isatty(self):
+        return self.tty
+
+    def read(self):
+        text, self.text = self.text, ""
+        return text
 
 
 def test_bang_output_rides_with_the_next_prompt(monkeypatch, tmp_path):
@@ -57,7 +81,7 @@ def test_bang_output_rides_with_the_next_prompt(monkeypatch, tmp_path):
     r = Repl(monkeypatch, ["!echo hello", "what did it print?", "next"]).run()
     first = r.turns[0]
     block = SHELL_BLOCK_HEAD.format(cmd="echo hello", status="exit 0") + "\nhello"
-    assert first == f"Working directory: {tmp_path}\n\n{block}\n\nwhat did it print?"
+    assert first == f"{header(tmp_path)}\n\n{block}\n\nwhat did it print?"
     assert r.turns[1] == "next"            # consumed by the turn, not resent
 
 
@@ -100,13 +124,13 @@ def test_undo_rewinds_and_prefills_the_prompt(monkeypatch, tmp_path):
     assert not (tmp_path / "made.txt").exists()
     assert r.seeds[3] == "two"             # the prompt read right after /undo
     assert [m["content"] for m in r.messages[1:]] == [
-        f"Working directory: {tmp_path}\n\none", "ok", "two again", "ok"]
+        f"{header(tmp_path, repo=True)}\n\none", "ok", "two again", "ok"]
 
 
 def test_undoing_the_first_turn_reinjects_the_cwd(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     r = Repl(monkeypatch, ["one", "/undo", "one again"]).run()
-    assert r.turns[1] == f"Working directory: {tmp_path}\n\none again"
+    assert r.turns[1] == f"{header(tmp_path)}\n\none again"
 
 
 def test_file_ref_is_attached_but_prompt_seed_stays_raw(monkeypatch, tmp_path):
@@ -130,3 +154,17 @@ def test_undoing_a_multiline_prompt_does_not_prefill_it(monkeypatch, tmp_path):
     r = Repl(monkeypatch, ["a \\", "b", "/undo"]).run()
     assert r.turns[0].endswith("a \nb")
     assert r.seeds[-1] == ""              # readline can't hold the newline
+
+
+def test_resume_takes_a_name_and_prompt_stays_a_prompt(monkeypatch, tmp_path):
+    # `--resume "fix the test"` used to read the prompt as a session name.
+    import argparse
+    seen = {}
+    monkeypatch.setattr(agent, "resolve_session", lambda name: seen.setdefault("name", name))
+    monkeypatch.chdir(tmp_path)
+    r = Repl(monkeypatch, [])
+    monkeypatch.setattr("sys.argv", ["local_agent.py", "-c", "fix the test"])
+    monkeypatch.setattr(agent, "load_session", lambda name: (_ for _ in ()).throw(OSError()))
+    r.run()
+    assert seen["name"] == ""                 # -c: the most recent session
+    assert r.turns[0].endswith("fix the test")

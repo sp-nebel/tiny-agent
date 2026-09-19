@@ -19,8 +19,8 @@ state its cache impact.** If you can't state it, you don't understand the change
 1. **The static prefix is sacred.** `config.SYSTEM` and `config.TOOL_SCHEMAS` are serialized
    at the front of every request and must be byte-identical across calls, sessions, and
    projects. Never interpolate anything dynamic into them (no cwd, no date, no per-project
-   text). Dynamic context goes in **user messages** — the cwd goes in the *first* user message
-   only (see `main()` in agent.py). Editing SYSTEM/TOOL_SCHEMAS in a commit is fine (users pay
+   text). Dynamic context goes in **user messages** — the cwd, repo/platform/date line and
+   AGENTS.md instructions go in the *first* user message only (see `context_header()` in agent.py). Editing SYSTEM/TOOL_SCHEMAS in a commit is fine (users pay
    one re-prefill after upgrading); making them *vary at runtime* is not. Adding a tool is
    the same trade: `append_file`'s schema grew the static prefix by ~120 tokens, paid once per
    process or resumed session, never per turn — so a tool is always on, never toggled.

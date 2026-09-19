@@ -12,7 +12,7 @@ behavior warrants it → doc sync. Do the first three always; they need nothing 
 ## 1. Static pass (always)
 
 ```bash
-python3 -m py_compile local_agent.py agent.py config.py ollama.py tools.py session.py checkpoint.py ui.py
+python3 -m py_compile local_agent.py agent.py config.py ollama.py tools.py session.py checkpoint.py ui.py commands.py
 ```
 
 Silence means success. Also confirm nothing imported a new third-party package — the
@@ -117,11 +117,18 @@ Run `python3 local_agent.py` and exercise:
   the current step's tool results. Tab during a reply stops it at once and opens `steer`; the
   pending tool call must NOT run, and the model's next step follows the note. Tab inside the
   `interject` prompt is readline completion, not a stop.
-- The `[y/N/reason]` hint is visible on a confirmation prompt, and bracketed tool results
-  (`[lines 1-100 of 543 …]`) appear under their `→ tool(...)` line (Rich would swallow them
-  unescaped).
+- The `[y/N/a/reason]` hint is visible on a confirmation prompt (`[y/N/reason]` for a
+  chained command, which can't be always-allowed); `a` stops later prompts for the same
+  command prefix or for all edits, and bracketed tool results
+  (`[lines 1-100 of 543 …]`) appear under their `→ tool …` line with `/details` on, or
+  when the call failed (Rich would swallow them unescaped).
+- `/details` and `/thinking` toggle the display only; a turn that runs 20s+ ends with a
+  bell (and a desktop notification on terminals that support OSC 9/777).
 - Ctrl-C while a tool is running — the turn aborts but history stays well-formed
   (stub `[interrupted before this tool ran]` results pair up any pending tool_calls).
+  Ctrl-C during `run_cmd` answers that call with its partial output plus
+  `[the user stopped this command …]`, and the command's process group is gone
+  (`ps` shows no leftover `sleep`).
 - `!git status` then a question about it — the model answers from the output; `!!ls` shows
   output but the model never sees it.
 - `@README.md summarize` prints `attached README.md` and the answer draws on the file;
@@ -132,6 +139,14 @@ Run `python3 local_agent.py` and exercise:
   --cached` look exactly as before the turn. Outside a repo it warns and rewinds only the
   conversation.
 - A multi-line paste arrives as one prompt, not one prompt per line.
+- `/help` lists built-ins and any `.tiny-agent/commands/*.md`; `/NAME args` sends the filled-in
+  template; a mistyped `/word` comes back in the input line instead of going to the model.
+- Tab at the prompt completes `@pa…` to a path and `/he…` to `/help`.
+- `/editor` opens `$EDITOR`; the saved text is sent as a prompt even if it starts with `!`.
+- `/history` then `/undo 2` rewinds two turns (files too, in a git repo).
+- `/export` writes a readable Markdown transcript; `/sessions` shows first-prompt titles.
+- `echo 'what is 2+2' | python3 local_agent.py > out.md` runs one turn: `out.md` holds only the
+  answer, everything else went to stderr, and an edit attempt without `--yes` is refused.
 - Ask for a long file edit: while the tool call is composed silently, the live region shows
   `generating… Ns without visible output` after ~2s and Esc still cancels. The next prompt
   must answer promptly — if it hangs for minutes, the abandoned generation wasn't torn down

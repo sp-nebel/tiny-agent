@@ -1,5 +1,6 @@
 import json
 import time
+import random
 import queue
 import socket
 import threading
@@ -125,7 +126,43 @@ def _chat_request(payload):
     )
 
 
-def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=False):
+# Error bodies that mean the prompt itself is too big: resending the same
+# payload can only fail the same way, however long we wait.
+_OVERFLOW_HINTS = ("context length", "context window", "exceeds the context",
+                   "too many tokens", "prompt is too long")
+
+
+def _retry_reason(err, body=""):
+    """A short label when `err` is worth retrying with the same payload, else
+    None. Covers the transient failures of a local server: overloaded or
+    busy (429, 503), the runner crashing or being OOM-killed mid-load (500,
+    502, 504), and the connection refused or reset while systemd restarts
+    it. A 4xx is the request's own fault and never retried."""
+    if isinstance(err, urllib.error.HTTPError):
+        if err.code not in (429, 500, 502, 503, 504):
+            return None
+        if any(h in body.lower() for h in _OVERFLOW_HINTS):
+            return None
+        return f"HTTP {err.code}"
+    reason = err.reason if isinstance(err, urllib.error.URLError) else err
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection refused"
+    if isinstance(reason, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        return "connection reset"
+    return None
+
+
+def _backoff(why, attempt):
+    """Sleep before retry `attempt` (0-based): 2s, 4s, 8s … capped, with
+    jitter so a burst of failures doesn't retry in lockstep."""
+    delay = min(config.RETRY_MAX_DELAY, config.RETRY_BASE_DELAY * 2 ** attempt)
+    delay *= random.uniform(0.8, 1.2)
+    config.console.print(f"[dim]Ollama: {why}; retry {attempt + 1}/{config.RETRY_MAX} "
+                         f"in {delay:.0f}s…[/dim]")
+    time.sleep(delay)
+
+
+def call_ollama(messages, timeout=None, retry_stall=False, _attempt=0):
     """Stream a chat turn.
 
     timeout overrides STREAM_TIMEOUT for this call only — run_turn passes a
@@ -186,26 +223,26 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
             if config.THINK and e.code == 400 and "think" in body.lower():
                 config.THINK = False
                 return call_ollama(messages, timeout=timeout,
-                                   retry_stall=retry_stall,
-                                   _retried_refused=_retried_refused)
+                                   retry_stall=retry_stall, _attempt=_attempt)
             e.body = body   # already consumed; stash for the handler in main()
-            raise
-        except urllib.error.URLError as e:
-            # Connection refused usually means Ollama is mid-restart (e.g.
-            # systemd bouncing it back up seconds after an OOM kill). One retry
-            # after a short delay rides through that window instead of losing
-            # the turn; the resent payload is byte-identical. A single flag
-            # (not unbounded recursion) keeps this from compounding with the
-            # think-fallback retry above into more than one wait.
-            if not _retried_refused and isinstance(e.reason, ConnectionRefusedError):
-                config.console.print(
-                    f"[dim]Ollama unreachable — it may have been restarted; "
-                    f"retrying in {config.RETRY_REFUSED_DELAY}s…[/dim]"
-                )
-                time.sleep(config.RETRY_REFUSED_DELAY)
+            why = _retry_reason(e, body)
+            if why and _attempt < config.RETRY_MAX:
+                _backoff(why, _attempt)
                 return call_ollama(messages, timeout=timeout,
-                                   retry_stall=retry_stall,
-                                   _retried_refused=True)
+                                   retry_stall=retry_stall, _attempt=_attempt + 1)
+            raise
+        except (urllib.error.URLError, ConnectionError) as e:
+            # Refused or reset usually means Ollama is mid-restart (systemd
+            # bouncing it back up seconds after an OOM kill). Backing off
+            # rides through that window instead of losing the turn. Only
+            # here, before any of the reply streamed: the resent payload is
+            # byte-identical, so the retry costs no cache. A reset raised by
+            # getresponse() arrives unwrapped, hence ConnectionError too.
+            why = _retry_reason(e)
+            if why and _attempt < config.RETRY_MAX:
+                _backoff(why, _attempt)
+                return call_ollama(messages, timeout=timeout,
+                                   retry_stall=retry_stall, _attempt=_attempt + 1)
             raise
 
         # cbreak lets us catch a single keypress — Esc to cancel, Tab to
@@ -308,8 +345,7 @@ def call_ollama(messages, timeout=None, retry_stall=False, _retried_refused=Fals
                 f"[dim]no data for {timeout}s on the post-trim call; retrying "
                 f"once (the server keeps its prefill progress)…[/dim]"
             )
-            return call_ollama(messages, timeout=timeout,
-                               _retried_refused=_retried_refused)
+            return call_ollama(messages, timeout=timeout, _attempt=_attempt)
         raise
 
     return content, thinking, tool_calls, cancelled, interrupted, stats

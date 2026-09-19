@@ -61,7 +61,7 @@ def test_binary_file_refused_and_untouched(tmp_path, monkeypatch):
 
 
 def test_decline_with_reason_is_passed_back_and_file_untouched(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "confirm", lambda msg: (False, "put it in README instead"))
+    monkeypatch.setattr(tools, "confirm", lambda msg, allow=None: (False, "put it in README instead"))
     p = tmp_path / "notes.md"
     p.write_text("one\n")
     result = append_file(str(p), "two\n")

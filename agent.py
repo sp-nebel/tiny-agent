@@ -1,21 +1,27 @@
 import os
 import re
+import sys
 import json
+import time
 import atexit
 import argparse
 import threading
 import contextlib
 import urllib.error
 
+from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape
 
 import config
+import commands
 import checkpoint
-from tools import dispatch, read_file, run_shell
+from tools import (dispatch, read_file, run_shell, normalize_call, _cap_output,
+                   CommandInterrupted)
 from ollama import call_ollama, warm_cache
 from ui import (read_prompt, read_multiline, fmt_args, truncate, fmt_stats,
-                take_interjections, interjections_pending)
+                take_interjections, interjections_pending, mark_turn_start,
+                notify, tool_failed, tool_call_label, tool_outcome)
 from session import *
 
 try:                      # line editing + history for the interactive prompt
@@ -71,6 +77,21 @@ INTERJECTION_PREFIX = "[user message sent mid-task] "
 STOP_NOTE_PREFIX = ("[the user interrupted you with this note; follow it, "
                     "then continue the task]\n")
 STOP_NOTE_DEFAULT = "Stop and reconsider what you were about to do."
+
+# Added to a tool result when the model has made the identical call and got
+# the identical result REPEAT_CALL_LIMIT times in a row this turn — the doom
+# loop a small model falls into (re-reading one range, re-running one grep).
+# Both call and result must repeat: re-running tests between edits is the
+# normal loop, and its output changes. Part of the result, so it lands at the
+# tail like any tool output and needs no extra model call, unlike the probe.
+REPEAT_CALL_NOTE = ("[you have made this exact {name} call {n} times in a row "
+                    "and got the same result each time. Repeating it will not "
+                    "give new information: use what you have, try a different "
+                    "approach, or give your answer.]")
+
+# Result for a run_cmd the user stopped with Ctrl-C, after whatever it printed.
+USER_STOPPED_CMD = ("[the user stopped this command before it finished; it may "
+                    "have partly run]")
 
 
 def deliver_interjections(messages):
@@ -391,6 +412,45 @@ def _add_stats(turn_stats, stats):
     _note_prefill_rate(stats)
 
 
+def _print_answer(content):
+    """A turn's final answer: rendered Markdown on the terminal, or the raw
+    text on stdout when that is a pipe (everything else then goes to
+    stderr), so `… | local_agent.py "review" > review.md` keeps just the
+    answer."""
+    if config.ANSWER_TO_STDOUT:
+        sys.stdout.write(content.strip() + "\n")
+        sys.stdout.flush()
+    else:
+        config.console.print(Markdown(content))
+
+
+TOOL_NAMES = ("read_file", "grep", "find_files", "list_dir", "cd",
+              "edit_file", "append_file", "run_cmd")
+
+
+def _show_result(name, label, early, result):
+    """Print a tool call's outcome: one line normally, the body too when it
+    failed or /details is on. Display only — the model gets the full result
+    either way. Rich reads any "[word …]" as a markup tag and drops an
+    unknown one silently, so everything here is escaped."""
+    outcome = tool_outcome(name, result)
+    failed  = tool_failed(name, result)
+    if early:
+        # A failed command's body is printed below and ends with its exit.
+        if outcome and name == "run_cmd" and not failed:
+            config.console.print(f"[dim]  {escape(outcome)}[/dim]")
+    else:
+        tail = f" [dim]({escape(outcome)})[/dim]" if outcome else ""
+        config.console.print(f"[cyan]→ {escape(label)}[/cyan]{tail}")
+    if name in ("edit_file", "append_file") and not config.SHOW_DETAILS:
+        # Their result is itself one short line, plus any syntax warning.
+        config.console.print(f"[{'yellow' if failed else 'dim'}]{escape(result)}[/]")
+    elif config.SHOW_DETAILS or failed:
+        config.console.print(f"[dim]{escape(truncate(result))}[/dim]")
+    if config.SHOW_DETAILS or failed or early:
+        config.console.print()
+
+
 def run_turn(messages, max_steps=20, check_every=20):
     # max_steps <= 0 means unlimited: no forced final step, no nudge.
     # check_every > 0 asks the model every that many tool steps whether it is
@@ -403,6 +463,9 @@ def run_turn(messages, max_steps=20, check_every=20):
     # round-trip); sum their stats and print one summary line when the turn
     # finishes, rather than a line per call.
     turn_stats = {}
+    mark_turn_start()
+    # (tool, canonical args) → (last result, times in a row it came back).
+    repeats = {}
     calls = 0
     step = 0
     since_check = 0
@@ -411,6 +474,7 @@ def run_turn(messages, max_steps=20, check_every=20):
     # them at the end and clean up what was fed back across the turn's tool
     # round-trips.
     turn_start = len(messages)
+    t0 = time.monotonic()
     try:
         while max_steps <= 0 or step < max_steps:
             deliver_interjections(messages)
@@ -455,9 +519,7 @@ def run_turn(messages, max_steps=20, check_every=20):
                     messages.append({"role": "assistant", "content": content})
                     config.console.print("[yellow]model reports it is stuck after "
                                          f"{step} steps — handing back to you[/yellow]")
-                    config.console.print(Markdown(content))
-                    if turn_stats:
-                        config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
+                    _print_answer(content)
                     return
                 # CONTINUE, a tool call, or anything else: the probe is
                 # discarded and work goes on with a fresh budget.
@@ -529,13 +591,11 @@ def run_turn(messages, max_steps=20, check_every=20):
 
                 # Final answer (normal early finish, or the forced last step).
                 if content.strip():
-                    config.console.print(Markdown(content))
+                    _print_answer(content)
                 elif last:
                     config.console.print("[yellow]hit step limit; model returned no answer[/yellow]")
                 else:
                     config.console.print("[yellow]model returned an empty answer[/yellow]")
-                if turn_stats:
-                    config.console.print(f"[dim]{fmt_stats(turn_stats, calls)}[/dim]")
                 return
 
             # The model addressed the user before calling its tools. That text
@@ -567,16 +627,42 @@ def run_turn(messages, max_steps=20, check_every=20):
                         except json.JSONDecodeError:
                             args = {}
 
+                    # The model's own name for the tool may be an alias
+                    # ("bash") that dispatch maps; show and record the real one.
+                    real, fixed = normalize_call(name, args)
+                    shown = real or name
                     # Rich reads any "[word …]" as a markup tag and drops an
                     # unknown one silently, so tool args and results — full of
                     # bracketed metadata like "[lines 1-100 of 543]" — must be
                     # escaped or the user sees them vanish.
-                    config.console.print(f"[cyan]→ {escape(name)}({escape(fmt_args(args))})[/cyan]")
-                    result = dispatch(name, args)
-                    config.console.print(f"[dim]{escape(truncate(result))}[/dim]\n")
+                    # Tools that print (a diff, a confirmation prompt) or can
+                    # run long get their call line up front; the quick
+                    # read-only ones get one line afterwards, with the outcome.
+                    label = tool_call_label(shown, fixed)
+                    early = shown in ("run_cmd", "edit_file", "append_file") or shown not in TOOL_NAMES
+                    if early:
+                        config.console.print(f"[cyan]→ {escape(label)}[/cyan]")
+                    try:
+                        result = dispatch(name, args)
+                    except CommandInterrupted as e:
+                        # The command ran, partly: it may have changed files,
+                        # so "interrupted before this tool ran" would be a lie
+                        # the model acts on. Answer this call with what it
+                        # printed; the finally stubs any calls after it.
+                        stopped = ((e.output + "\n") if e.output else "") + USER_STOPPED_CMD
+                        messages.append({"role": "tool", "content": stopped, "name": shown})
+                        answered += 1
+                        raise
+                    key = (shown, json.dumps(args, sort_keys=True, default=str))
+                    last, n = repeats.get(key, (None, 0))
+                    n = n + 1 if result == last else 1
+                    repeats[key] = (result, n)
+                    if n >= config.REPEAT_CALL_LIMIT:
+                        result += "\n" + REPEAT_CALL_NOTE.format(name=shown, n=n)
+                    _show_result(shown, label, early, result)
 
                     # Tool results use role "tool", one message per call.
-                    messages.append({"role": "tool", "content": result, "name": name})
+                    messages.append({"role": "tool", "content": result, "name": shown})
                     answered += 1
             finally:
                 for tc in tool_calls[answered:]:
@@ -612,6 +698,92 @@ def run_turn(messages, max_steps=20, check_every=20):
         if stubbed:
             config.console.print(f"[dim]compacted {stubbed} tool output"
                           f"{'s' if stubbed != 1 else ''} from this turn[/dim]")
+        # After the cleanup, so ctx% is what the next turn starts from.
+        if turn_stats:
+            pct = 100 * _total_tokens(messages) // config.NUM_CTX
+            config.console.print(f"[dim]{fmt_stats(turn_stats, calls, time.monotonic() - t0, pct)}[/dim]")
+        notify("turn finished")
+
+# --------------------------------------------------------------------------- #
+# First-message context
+# --------------------------------------------------------------------------- #
+
+# Leads an instructions file's text in the first user message. Imperative,
+# like the other bracketed lead-ins: a small model treats unlabelled text as
+# something to comment on, not rules to work by.
+INSTRUCTIONS_HEAD = "[instructions from {path}; follow them while you work]"
+
+
+def _git_root(start):
+    """The nearest enclosing directory with a .git entry, or None. A plain
+    walk instead of `git rev-parse`: this runs before every first message
+    and must not depend on git being installed."""
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def find_instructions(start):
+    """The project instructions file for `start`: the first of
+    config.INSTRUCTION_FILES found walking up from `start` to the git root.
+    Outside a repo only `start` itself is looked at — walking up to / would
+    pick up whatever happens to sit in a parent directory."""
+    d    = os.path.abspath(start)
+    root = _git_root(d)
+    while True:
+        for name in config.INSTRUCTION_FILES:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                return path
+        if root is None or d == root:
+            return None
+        d = os.path.dirname(d)
+
+
+def _instructions_block(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    cap = config.INSTRUCTIONS_MAX_CHARS
+    if len(text) > cap:
+        text = (text[:cap] + f"\n[… cut at {cap} chars; read_file {path} "
+                f"with start=1 for the rest]")
+    return INSTRUCTIONS_HEAD.format(path=path) + "\n" + text
+
+
+def context_header():
+    """What the first user message of a conversation opens with: the cwd,
+    whether it is a git repo, platform and date, then the global and the
+    project instructions files, if any.
+
+    Lives in the first user message, never in SYSTEM, so the cached static
+    prefix stays byte-identical across projects and days. Read again at
+    each /clear, so an edited AGENTS.md takes effect from the next
+    conversation; a running one keeps what it was sent (rewriting the
+    first message would bust the whole cache).
+    """
+    cwd  = os.getcwd()
+    root = _git_root(cwd)
+    env  = (f"Working directory: {cwd}\n"
+            f"Git repo: {('yes, root ' + root) if root else 'no'} · "
+            f"Platform: {sys.platform} · Date: {time.strftime('%Y-%m-%d')}")
+    blocks = [env]
+    project = find_instructions(cwd)
+    for path in (config.GLOBAL_INSTRUCTIONS, project):
+        block = path and os.path.isfile(path) and _instructions_block(path)
+        if block:
+            blocks.append(block)
+            config.console.print(f"[dim]instructions from {escape(path)}[/dim]")
+    return "\n\n".join(blocks)
 
 # --------------------------------------------------------------------------- #
 # Prompt expansions
@@ -632,16 +804,28 @@ def run_shell_escape(cmd):
     the model gets is capped the same way. A subshell, so `!cd` changes
     nothing that outlives it.
     """
-    output, code = run_shell(cmd)
-    if code is None:
+    try:
+        output, code, timed_out = run_shell(cmd)
+    except CommandInterrupted as e:
+        # Ctrl-C at the prompt used to escape main() with a traceback. The
+        # user stopped their own command: keep what it printed, like a
+        # timeout, rather than losing it.
+        output, timed_out, code = e.output, False, None
+    if timed_out:
         status = f"timed out after {config.CMD_TIMEOUT}s"
-        output = ""
+    elif code is None:
+        status = "stopped with Ctrl-C"
     else:
         status = f"exit {code}"
     if output:
         config.console.print(f"[dim]{escape(output)}[/dim]")
     config.console.print(f"[dim]{escape(status)}[/dim]")
     return SHELL_BLOCK_HEAD.format(cmd=cmd, status=status) + "\n" + (output or "[no output]")
+
+# Leads text piped in on stdin, which rides ahead of the prompt in the first
+# message like `!cmd` output does. Says where it came from, so the model
+# doesn't take a diff for something it produced.
+PIPED_HEAD = "[input piped to the agent by the user]"
 
 # An `@path` token: at the start of the prompt or after whitespace, so an
 # email address or a decorator in pasted code is not one.
@@ -650,6 +834,24 @@ FILE_REF_RE     = re.compile(r"(?<!\S)@(\S+)")
 # than belonging to it; stripped only when the token as typed isn't a file.
 FILE_REF_TRAIL  = ".,;:!?)]}'\""
 FILE_BLOCK_HEAD = "[contents of {path}, attached by the user]"
+# `@path#10-40` (or `#10`) attaches just those lines.
+FILE_RANGE_RE   = re.compile(r"#(\d+)(?:-(\d+))?$")
+
+
+def _resolve_file_ref(token):
+    """(path as typed, start, end) for an `@token` naming an existing file,
+    or None. Tried as typed first, then without trailing sentence
+    punctuation; each with an optional #A-B line range."""
+    for cand in (token, token.rstrip(FILE_REF_TRAIL)):
+        path, start, end = cand, 1, None
+        rng = FILE_RANGE_RE.search(cand)
+        if rng and not os.path.isfile(os.path.expanduser(cand)):
+            path  = cand[:rng.start()]
+            start = int(rng.group(1))
+            end   = int(rng.group(2) or rng.group(1))
+        if path and os.path.isfile(os.path.expanduser(path)):
+            return path, start, end
+    return None
 
 
 def expand_file_refs(text):
@@ -667,22 +869,24 @@ def expand_file_refs(text):
     blocks = []
     seen   = set()
     for m in FILE_REF_RE.finditer(text):
-        path = m.group(1)
-        if not os.path.isfile(os.path.expanduser(path)):
-            path = path.rstrip(FILE_REF_TRAIL)
-        full = os.path.expanduser(path)
-        if not path or not os.path.isfile(full) or full in seen:
+        ref = _resolve_file_ref(m.group(1))
+        if ref is None:
             continue
-        seen.add(full)
-        blocks.append(FILE_BLOCK_HEAD.format(path=path) + "\n" + read_file(full))
-        config.console.print(f"[dim]attached {escape(path)}[/dim]")
+        path, start, end = ref
+        full = os.path.expanduser(path)
+        if (full, start, end) in seen:
+            continue
+        seen.add((full, start, end))
+        shown = path if end is None else f"{path} lines {start}-{end}"
+        blocks.append(FILE_BLOCK_HEAD.format(path=shown) + "\n" + read_file(full, start, end))
+        config.console.print(f"[dim]attached {escape(shown)}[/dim]")
     return "\n\n".join([text] + blocks)
 
 # --------------------------------------------------------------------------- #
 # Undo
 # --------------------------------------------------------------------------- #
 
-def undo_last_turn(messages, turns):
+def undo_last_turn(messages, turns, announce=True):
     """Rewind the most recent turn: restore the files it changed from its
     git snapshot, cut its messages off the tail, and return its record (so
     main can put the prompt back in the input line and restore first_user_msg);
@@ -718,6 +922,8 @@ def undo_last_turn(messages, turns):
     del messages[rec["msg_index"]:]
     with contextlib.suppress(OSError):
         os.chdir(rec["cwd"])
+    if not announce:
+        return rec
     if "\n" in rec["prompt"]:
         # readline edits one line; a multi-line prompt inserted into it
         # garbles the display, so show it instead of pre-filling it.
@@ -741,13 +947,36 @@ def main():
     ap.add_argument("--check-every", type=int, default=20,
                     help="every N tool round-trips, ask the model whether it is looping and "
                          "stop if it says so (0 = never; inert under the default --max-steps)")
-    ap.add_argument("--resume",    nargs="?", const="", default=None,
-                     help="resume a saved session by name; bare --resume resumes the most recent")
+    # --resume takes a required name, and "the most recent" is a separate
+    # flag with no value: an optional value next to the nargs="*" prompt
+    # made `--resume "fix the test"` read the prompt as a session name.
+    ap.add_argument("--resume",    metavar="NAME", default=None,
+                    help="resume the saved session NAME")
+    ap.add_argument("-c", "--continue", dest="cont", action="store_true",
+                    help="resume the most recent saved session")
     args = ap.parse_args()
+    if args.cont and args.resume is None:
+        args.resume = ""
 
     if args.model:
         config.MODEL = args.model
     config.AUTO_YES = args.yes
+
+    # stdin that isn't a terminal is input, not a keyboard: `git diff |
+    # local_agent.py "review this"` runs one turn on it and exits. Nobody
+    # can answer a confirmation, so writes and commands need --yes (see
+    # tools.confirm). With stdout piped too, only the answer goes there.
+    piped      = not sys.stdin.isatty()
+    piped_text = ""
+    if piped:
+        piped_text         = sys.stdin.read()
+        config.INTERACTIVE = False
+        if not sys.stdout.isatty():
+            config.ANSWER_TO_STDOUT = True
+            config.console          = Console(stderr=True)
+        if not args.prompt and not piped_text.strip():
+            config.console.print("[red]nothing to do: no prompt and nothing on stdin[/red]")
+            sys.exit(2)
 
     # Persistent prompt history: importing readline upgrades input() in place,
     # so config.console.input gets line editing and up-arrow recall for free.
@@ -762,10 +991,17 @@ def main():
             with contextlib.suppress(OSError):
                 readline.write_history_file(histfile)
         atexit.register(save_history)
+        commands.install_completer(
+            readline, lambda: list(commands.load_custom_commands(
+                _git_root(os.getcwd()) or os.getcwd())))
 
     messages       = [{"role": "system", "content": config.SYSTEM}]
     first_user_msg = True
     session_name   = None
+    # The conversation's first prompt, shown by /sessions in place of a bare
+    # timestamp. Not an LLM-written title: that would be an extra call, and
+    # with Ollama's single cache slot it would evict the conversation.
+    session_title  = ""
     # One record per turn, newest last, for /undo: where the turn's messages
     # start, its raw prompt, the cwd and first_user_msg it began with, and a
     # git snapshot of the working tree (None outside a repo). Indices into
@@ -783,11 +1019,18 @@ def main():
 
     def autosave():
         # Skip a system-prompt-only conversation so exits without real work
-        # don't litter the session store.
-        if len(messages) > 1:
+        # don't litter the session store — and a piped one-shot run, which
+        # a script may make hundreds of times.
+        if len(messages) > 1 and not piped:
             with contextlib.suppress(OSError):
-                save_session(session_name or default_ts_name(), messages)
+                save_session(session_name or default_ts_name(), messages, session_title)
     atexit.register(autosave)
+
+    def project_root():
+        return _git_root(os.getcwd()) or os.getcwd()
+
+    def custom_commands():
+        return commands.load_custom_commands(project_root())
 
     if args.resume is not None:
         path = resolve_session(args.resume)
@@ -800,6 +1043,7 @@ def main():
                 # strip_nudges ran) can carry a stray nudge; drop it on restore.
                 messages[:] = [m for m in messages if not _is_stray_nudge(m)]
                 session_name   = name
+                session_title  = data.get("title", "")
                 first_user_msg = False
                 config.console.print(f"[dim]resumed session '{escape(name)}' ({len(messages)} messages)[/dim]")
             except (OSError, ValueError, KeyError, TypeError):
@@ -808,6 +1052,15 @@ def main():
             config.console.print("[yellow]no matching session; starting fresh[/yellow]")
 
     initial = " ".join(args.prompt).strip()
+    # Piped text is sent as it is, never parsed as `!cmd` or `/command`.
+    literal_first = False
+    if piped and piped_text.strip():
+        if initial:
+            pending_shell.append(PIPED_HEAD + "\n" + _cap_output(piped_text.strip(),
+                                                                 config.MAX_PIPED_CHARS))
+        else:
+            initial       = piped_text.strip()
+            literal_first = True
 
     # Interactive start: prefill the static prefix — or, if a session was just
     # restored, the full restored history — while the user types their first
@@ -819,18 +1072,16 @@ def main():
         threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
 
     config.console.print(f"[bold]tiny-agent[/bold] · {escape(config.MODEL)} · {escape(os.getcwd())}")
-    config.console.print(
-        "[dim]model warms up in the background; the first reply is slow if it "
-        "hasn't finished. later turns reuse the KV cache. while a reply "
-        "streams, just start typing to queue a message for the model; Tab "
-        "stops the reply now so you can steer it; Esc cancels the reply. "
-        "'!cmd' runs a shell command and sends its output with your next "
-        "message ('!!cmd': shown only to you), '@path' attaches a file, a "
-        "trailing '\\' continues the line. '/undo' takes back the last turn "
-        "(files too, in a git repo), '/clear' to reset context, '/save', '/resume', "
-        "'/sessions' to pause/switch conversations (each takes an optional "
-        "name), 'exit' to quit.[/dim]\n"
-    )
+    if not piped:
+        config.console.print(
+            "[dim]model warms up in the background; the first reply is slow if it "
+            "hasn't finished. later turns reuse the KV cache. while a reply "
+            "streams, just start typing to queue a message for the model; Tab "
+            "stops the reply now so you can steer it; Esc cancels the reply. "
+            "'!cmd' runs a shell command and sends its output with your next "
+            "message, '@path' attaches a file, '/undo' takes back the last turn, "
+            "'/help' lists every command, 'exit' quits.[/dim]\n"
+        )
 
     while True:
         if initial:
@@ -845,109 +1096,198 @@ def main():
                 config.console.print("\nbye")
                 return
 
-        if user.lower() in ("exit", "quit"):
-            return
-        if user.startswith("!"):
-            local = user.startswith("!!")
-            cmd   = user[2 if local else 1:].strip()
-            if cmd:
-                block = run_shell_escape(cmd)
-                if not local:
-                    pending_shell.append(block)
-                    config.console.print("[dim]output goes to the model with your next message[/dim]")
-            config.console.print()
-            continue
-        if user.lower() in ("/clear", "clear"):
-            # Drop all conversation history but keep messages[0] (the static
-            # system prompt). The system prompt + tool schemas are the cached
-            # prefix, so this frees the context window without paying to
-            # prefill them again. Resetting first_user_msg re-injects the cwd
-            # context into the next first user message.
-            del messages[1:]
-            del turns[:]
-            del pending_shell[:]
-            first_user_msg = True
-            config.console.print("[dim]context cleared (system prompt preserved)[/dim]\n")
-            continue
-        if user.lower() == "/sessions":
-            files = list_sessions()
-            if not files:
-                config.console.print("[dim]no saved sessions[/dim]\n")
+        # The raw text of the prompt as typed, for /undo and the session
+        # title; differs from `user` when a custom command expanded it.
+        raw_prompt = user
+        # Text written in /editor is a prompt, whatever it starts with: a
+        # first line of "!rm …" or "/save x" must not run as a command.
+        literal, literal_first = literal_first, False
+        if not literal and user.lower() == "/editor":
+            text = commands.edit_in_editor()
+            if text is None or not text.strip():
+                if text is not None:
+                    config.console.print("[dim]empty prompt; nothing sent[/dim]\n")
                 continue
-            for f in files:
-                name = os.path.splitext(os.path.basename(f))[0]
-                try:
-                    with open(f, "r", encoding="utf-8") as fh:
-                        meta = json.load(fh)
-                except (OSError, ValueError):
+            user = raw_prompt = text.strip()
+            literal = True
+            config.console.print(f"[bold green]you[/bold green] {escape(user)}")
+
+        if not literal:
+            if user.lower() in ("exit", "quit"):
+                return
+            if user.startswith("!"):
+                local = user.startswith("!!")
+                cmd   = user[2 if local else 1:].strip()
+                if cmd:
+                    block = run_shell_escape(cmd)
+                    if not local:
+                        pending_shell.append(block)
+                        config.console.print("[dim]output goes to the model with your next message[/dim]")
+                config.console.print()
+                continue
+            if user.lower() in ("/clear", "clear"):
+                # Drop all conversation history but keep messages[0] (the static
+                # system prompt). The system prompt + tool schemas are the cached
+                # prefix, so this frees the context window without paying to
+                # prefill them again. Resetting first_user_msg re-injects the cwd
+                # context into the next first user message.
+                del messages[1:]
+                del turns[:]
+                del pending_shell[:]
+                first_user_msg = True
+                session_title  = ""
+                config.console.print("[dim]context cleared (system prompt preserved)[/dim]\n")
+                continue
+            if user.lower() in ("/details", "/thinking"):
+                # Display only: what the model is sent (and the `think` flag,
+                # which would change the prompt template) stays as it was.
+                attr = "SHOW_DETAILS" if user.lower() == "/details" else "SHOW_THINKING"
+                setattr(config, attr, not getattr(config, attr))
+                what = ("full tool results" if attr == "SHOW_DETAILS"
+                        else "the model's reasoning while it streams")
+                config.console.print(f"[dim]{'showing' if getattr(config, attr) else 'hiding'} "
+                                     f"{what}[/dim]\n")
+                continue
+            if user.lower() == "/sessions":
+                files = list_sessions()
+                if not files:
+                    config.console.print("[dim]no saved sessions[/dim]\n")
                     continue
-                marker = " [bold]*[/bold]" if name == session_name else ""
-                n        = len(meta.get("messages", []))
-                saved_at = meta.get("saved_at", "?")
-                config.console.print(f"[dim]{escape(name)}{marker} — {escape(str(saved_at))} · {n} messages[/dim]")
-            config.console.print()
-            continue
-        if user.lower() == "/save" or user.lower().startswith("/save "):
-            arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
-            name = arg_name or session_name or default_ts_name()
-            save_session(name, messages)
-            session_name = name
-            config.console.print(f"[dim]saved session '{escape(name)}'[/dim]\n")
-            continue
-        if user.lower() == "/resume" or user.lower().startswith("/resume "):
-            arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
-            path = resolve_session(arg_name)
-            if not path:
-                config.console.print("[yellow]no matching session; conversation unchanged[/yellow]\n")
+                for f in files:
+                    name = os.path.splitext(os.path.basename(f))[0]
+                    try:
+                        with open(f, "r", encoding="utf-8") as fh:
+                            meta = json.load(fh)
+                    except (OSError, ValueError):
+                        continue
+                    marker = " [bold]*[/bold]" if name == session_name else ""
+                    n        = len(meta.get("messages", []))
+                    saved_at = meta.get("saved_at", "?")
+                    title    = meta.get("title") or ""
+                    title    = f" — {title}" if title else ""
+                    config.console.print(f"[dim]{escape(name)}{marker}{escape(title)} · "
+                                         f"{escape(str(saved_at))} · {n} messages[/dim]")
+                config.console.print()
                 continue
-            new_name = os.path.splitext(os.path.basename(path))[0]
-            # Switching away from a named, non-empty session shouldn't lose it.
-            if session_name and len(messages) > 1:
-                with contextlib.suppress(OSError):
-                    save_session(session_name, messages)
-            try:
-                data = load_session(new_name)
-                apply_session(messages, data, args.model)
-                messages[:] = [m for m in messages if not _is_stray_nudge(m)]
-            except (OSError, ValueError, KeyError, TypeError):
-                config.console.print("[yellow]could not read session; conversation unchanged[/yellow]\n")
+            if user.lower() == "/save" or user.lower().startswith("/save "):
+                arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
+                name = arg_name or session_name or default_ts_name()
+                save_session(name, messages, session_title)
+                session_name = name
+                config.console.print(f"[dim]saved session '{escape(name)}'[/dim]\n")
                 continue
-            session_name   = new_name
-            first_user_msg = False
-            del turns[:]
-            del pending_shell[:]
-            config.console.print(f"[dim]resumed session '{escape(new_name)}' ({len(messages)} messages)[/dim]\n")
-            threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
-            continue
-        if user.lower() == "/undo":
-            rec = undo_last_turn(messages, turns)
-            if rec:
-                first_user_msg = rec["first"]
-                seed           = "" if "\n" in rec["prompt"] else rec["prompt"]
+            if user.lower() == "/resume" or user.lower().startswith("/resume "):
+                arg_name = user.split(maxsplit=1)[1].strip() if " " in user else ""
+                path = resolve_session(arg_name)
+                if not path:
+                    config.console.print("[yellow]no matching session; conversation unchanged[/yellow]\n")
+                    continue
+                new_name = os.path.splitext(os.path.basename(path))[0]
+                # Switching away from a named, non-empty session shouldn't lose it.
+                if session_name and len(messages) > 1:
+                    with contextlib.suppress(OSError):
+                        save_session(session_name, messages, session_title)
+                try:
+                    data = load_session(new_name)
+                    apply_session(messages, data, args.model)
+                    messages[:] = [m for m in messages if not _is_stray_nudge(m)]
+                except (OSError, ValueError, KeyError, TypeError):
+                    config.console.print("[yellow]could not read session; conversation unchanged[/yellow]\n")
+                    continue
+                session_name   = new_name
+                session_title  = data.get("title", "")
+                first_user_msg = False
+                del turns[:]
+                del pending_shell[:]
+                config.console.print(f"[dim]resumed session '{escape(new_name)}' ({len(messages)} messages)[/dim]\n")
                 threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
-            continue
+                continue
+            if user.lower() == "/undo" or re.fullmatch(r"/undo\s+\d+", user.lower()):
+                n   = max(1, int(user.split()[1])) if " " in user else 1
+                rec = None
+                # One turn at a time, newest first, so each restore lands on the
+                # snapshot the next-older turn started from.
+                for i in range(n):
+                    if not turns:
+                        break
+                    rec = undo_last_turn(messages, turns, announce=(i == n - 1 or len(turns) == 1))
+                if rec is None:
+                    undo_last_turn(messages, turns)      # prints "nothing to undo"
+                else:
+                    first_user_msg = rec["first"]
+                    seed           = "" if "\n" in rec["prompt"] else rec["prompt"]
+                    if first_user_msg:
+                        session_title = ""
+                    threading.Thread(target=warm_cache, args=(list(messages),), daemon=True).start()
+                continue
+            if user.lower() == "/history":
+                if not turns:
+                    config.console.print("[dim]no turns to list yet (a resumed or cleared "
+                                         "conversation starts a new list)[/dim]\n")
+                    continue
+                for i, rec in enumerate(turns, start=1):
+                    first = rec["prompt"].split("\n", 1)[0]
+                    more  = " …" if "\n" in rec["prompt"] or len(first) > 70 else ""
+                    config.console.print(f"[dim]{i:3}  {escape(first[:70])}{more}[/dim]")
+                config.console.print(f"[dim]/undo N takes back the last N of these "
+                                     f"({len(turns)} in all)[/dim]\n")
+                continue
+            if user.lower() == "/export" or user.lower().startswith("/export "):
+                target = user.split(maxsplit=1)[1].strip() if " " in user else ""
+                target = os.path.expanduser(target or f"tiny-agent-{session_name or default_ts_name()}.md")
+                try:
+                    with open(target, "w", encoding="utf-8") as f:
+                        f.write(commands.export_markdown(messages, session_title))
+                    config.console.print(f"[dim]wrote {escape(target)}[/dim]\n")
+                except OSError as e:
+                    config.console.print(f"[red]could not write {escape(target)}: {escape(str(e))}[/red]\n")
+                continue
+            if user.lower() == "/help":
+                commands.print_help(custom_commands())
+                continue
+            if user.startswith("/"):
+                name, _, argstr = user.partition(" ")
+                custom = custom_commands()
+                if name.lower() in custom:
+                    raw_prompt = user
+                    user = commands.expand_custom_command(custom[name.lower()][2],
+                                                          argstr.strip(), run_shell)
+                    config.console.print(f"[dim]{escape(name.lower())} → "
+                                         f"{len(user)} chars[/dim]")
+                elif re.fullmatch(r"/[A-Za-z][\w-]*", name) and not os.path.exists(name):
+                    # Almost certainly a mistyped command, not a question about
+                    # the path /word: don't spend a turn sending it to the model.
+                    config.console.print(f"[yellow]unknown command {escape(name)}; "
+                                         f"/help lists them[/yellow]\n")
+                    seed = "" if "\n" in user else user
+                    continue
         if not user:
             continue
 
         # Snapshot before the turn can touch anything. Stat-cached (see
         # checkpoint._write_tree), so on an unchanged tree it costs a few git
         # calls, not a re-hash of the repo.
-        turns.append({"msg_index": len(messages), "prompt": user, "first": first_user_msg,
+        turns.append({"msg_index": len(messages), "prompt": raw_prompt, "first": first_user_msg,
                       "cwd": os.getcwd(), "snap": checkpoint.snapshot()})
+        if first_user_msg:
+            session_title = raw_prompt.split("\n", 1)[0][:80]
 
-        # cwd injected into the FIRST user message only — keeps the system
-        # prompt byte-identical across projects so the prefix cache hits every
-        # session. Computed here, not once at startup, so a `cd` tool call or
-        # a `/clear` (which resets first_user_msg) picks up the current
-        # directory instead of whatever it was when the process started.
+        # cwd and instructions injected into the FIRST user message only —
+        # keeps the system prompt byte-identical across projects so the
+        # prefix cache hits every session. Computed here, not once at
+        # startup, so a `cd` tool call or a `/clear` (which resets
+        # first_user_msg) picks up the current directory instead of whatever
+        # it was when the process started.
         content        = "\n\n".join(pending_shell + [expand_file_refs(user)])
-        content        = (f"Working directory: {os.getcwd()}\n\n" + content) if first_user_msg else content
+        content        = (context_header() + "\n\n" + content) if first_user_msg else content
         del pending_shell[:]
         first_user_msg = False
         messages.append({"role": "user", "content": content})
 
+        failed = True
         try:
             run_turn(messages, max_steps=args.max_steps, check_every=args.check_every)
+            failed = False
         except urllib.error.HTTPError as e:
             body = getattr(e, "body", "") or e.read().decode(errors="replace")
             config.console.print(f"[red]Ollama error {e.code}: {escape(body.strip() or str(e.reason))}[/red]")
@@ -975,3 +1315,6 @@ def main():
         if leftover:
             initial = "\n".join(leftover)
         config.console.print()
+        if piped:
+            # One turn per run; the exit code says whether it got an answer.
+            sys.exit(1 if failed else 0)
