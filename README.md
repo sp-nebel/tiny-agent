@@ -168,7 +168,7 @@ Newest first. Every commit adds its entry here (see `CLAUDE.md`).
 
 ### 2026-09-23
 
-- **Cleanup after #5**: Tab completion no longer re-reads every custom command file and re-globs the directory once per candidate. It builds the list once per Tab press and reads commands only when completing a `/word`. The "did you mean" path search now stops at its file cap even inside one huge directory. Fuzzy `edit_file` matching is cheaper on long files. The rest is internal tidying with no visible change (one retry path in `ollama.py`, one tool-name normalizer, one turn clock).
+- **Cleanup after #5** (`594a1be`, merged in #6): Tab completion no longer re-reads every custom command file and re-globs the directory once per candidate. It builds the list once per Tab press and reads commands only when completing a `/word`. The "did you mean" path search now stops at its file cap even inside one huge directory. Fuzzy `edit_file` matching is cheaper on long files. The rest is internal tidying with no visible change (one retry path in `ollama.py`, one tool-name normalizer, one turn clock).
 
 ### 2026-09-18
 
