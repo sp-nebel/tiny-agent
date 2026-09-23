@@ -214,31 +214,26 @@ def call_ollama(messages, timeout=None, retry_stall=False, _attempt=0):
     try:
         try:
             resp = urllib.request.urlopen(req, timeout=timeout)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
-            # Model doesn't support the `think` parameter — disable and retry
-            # once so non-thinking models (the default) keep working. Other
-            # 400s (no tool support, bad request) must surface, so check the
-            # error body.
-            if config.THINK and e.code == 400 and "think" in body.lower():
-                config.THINK = False
-                return call_ollama(messages, timeout=timeout,
-                                   retry_stall=retry_stall, _attempt=_attempt)
-            e.body = body   # already consumed; stash for the handler in main()
-            why = _retry_reason(e, body)
-            if why and _attempt < config.RETRY_MAX:
-                _backoff(why, _attempt)
-                return call_ollama(messages, timeout=timeout,
-                                   retry_stall=retry_stall, _attempt=_attempt + 1)
-            raise
-        except (urllib.error.URLError, ConnectionError) as e:
+        except (urllib.error.URLError, ConnectionError) as e:   # HTTPError too
+            body = ""
+            if isinstance(e, urllib.error.HTTPError):
+                body = e.read().decode(errors="replace")
+                # Model doesn't support the `think` parameter — disable and
+                # retry once so non-thinking models (the default) keep
+                # working. Other 400s (no tool support, bad request) must
+                # surface, so check the error body.
+                if config.THINK and e.code == 400 and "think" in body.lower():
+                    config.THINK = False
+                    return call_ollama(messages, timeout=timeout,
+                                       retry_stall=retry_stall, _attempt=_attempt)
+                e.body = body   # already consumed; stash for the handler in main()
             # Refused or reset usually means Ollama is mid-restart (systemd
             # bouncing it back up seconds after an OOM kill). Backing off
             # rides through that window instead of losing the turn. Only
             # here, before any of the reply streamed: the resent payload is
             # byte-identical, so the retry costs no cache. A reset raised by
             # getresponse() arrives unwrapped, hence ConnectionError too.
-            why = _retry_reason(e)
+            why = _retry_reason(e, body)
             if why and _attempt < config.RETRY_MAX:
                 _backoff(why, _attempt)
                 return call_ollama(messages, timeout=timeout,
