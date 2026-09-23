@@ -19,9 +19,9 @@ import checkpoint
 from tools import (dispatch, read_file, run_shell, normalize_call, _cap_output,
                    CommandInterrupted)
 from ollama import call_ollama, warm_cache
-from ui import (read_prompt, read_multiline, fmt_args, truncate, fmt_stats,
+from ui import (read_prompt, read_multiline, truncate, fmt_stats,
                 take_interjections, interjections_pending, mark_turn_start,
-                notify, tool_failed, tool_call_label, tool_outcome)
+                turn_elapsed, notify, tool_failed, tool_call_label, tool_outcome)
 from session import *
 
 try:                      # line editing + history for the interactive prompt
@@ -424,10 +424,6 @@ def _print_answer(content):
         config.console.print(Markdown(content))
 
 
-TOOL_NAMES = ("read_file", "grep", "find_files", "list_dir", "cd",
-              "edit_file", "append_file", "run_cmd")
-
-
 def _show_result(name, label, early, result):
     """Print a tool call's outcome: one line normally, the body too when it
     failed or /details is on. Display only — the model gets the full result
@@ -474,7 +470,6 @@ def run_turn(messages, max_steps=20, check_every=20):
     # them at the end and clean up what was fed back across the turn's tool
     # round-trips.
     turn_start = len(messages)
-    t0 = time.monotonic()
     try:
         while max_steps <= 0 or step < max_steps:
             deliver_interjections(messages)
@@ -639,7 +634,7 @@ def run_turn(messages, max_steps=20, check_every=20):
                     # run long get their call line up front; the quick
                     # read-only ones get one line afterwards, with the outcome.
                     label = tool_call_label(shown, fixed)
-                    early = shown in ("run_cmd", "edit_file", "append_file") or shown not in TOOL_NAMES
+                    early = real is None or real in ("run_cmd", "edit_file", "append_file")
                     if early:
                         config.console.print(f"[cyan]→ {escape(label)}[/cyan]")
                     try:
@@ -701,7 +696,7 @@ def run_turn(messages, max_steps=20, check_every=20):
         # After the cleanup, so ctx% is what the next turn starts from.
         if turn_stats:
             pct = 100 * _total_tokens(messages) // config.NUM_CTX
-            config.console.print(f"[dim]{fmt_stats(turn_stats, calls, time.monotonic() - t0, pct)}[/dim]")
+            config.console.print(f"[dim]{fmt_stats(turn_stats, calls, turn_elapsed(), pct)}[/dim]")
         notify("turn finished")
 
 # --------------------------------------------------------------------------- #
@@ -779,7 +774,7 @@ def context_header():
     blocks = [env]
     project = find_instructions(cwd)
     for path in (config.GLOBAL_INSTRUCTIONS, project):
-        block = path and os.path.isfile(path) and _instructions_block(path)
+        block = path and _instructions_block(path)
         if block:
             blocks.append(block)
             config.console.print(f"[dim]instructions from {escape(path)}[/dim]")
@@ -978,6 +973,9 @@ def main():
             config.console.print("[red]nothing to do: no prompt and nothing on stdin[/red]")
             sys.exit(2)
 
+    def custom_commands():
+        return commands.load_custom_commands(_git_root(os.getcwd()) or os.getcwd())
+
     # Persistent prompt history: importing readline upgrades input() in place,
     # so config.console.input gets line editing and up-arrow recall for free.
     if readline:
@@ -991,9 +989,7 @@ def main():
             with contextlib.suppress(OSError):
                 readline.write_history_file(histfile)
         atexit.register(save_history)
-        commands.install_completer(
-            readline, lambda: list(commands.load_custom_commands(
-                _git_root(os.getcwd()) or os.getcwd())))
+        commands.install_completer(readline, lambda: list(custom_commands()))
 
     messages       = [{"role": "system", "content": config.SYSTEM}]
     first_user_msg = True
@@ -1025,12 +1021,6 @@ def main():
             with contextlib.suppress(OSError):
                 save_session(session_name or default_ts_name(), messages, session_title)
     atexit.register(autosave)
-
-    def project_root():
-        return _git_root(os.getcwd()) or os.getcwd()
-
-    def custom_commands():
-        return commands.load_custom_commands(project_root())
 
     if args.resume is not None:
         path = resolve_session(args.resume)
@@ -1249,7 +1239,6 @@ def main():
                 name, _, argstr = user.partition(" ")
                 custom = custom_commands()
                 if name.lower() in custom:
-                    raw_prompt = user
                     user = commands.expand_custom_command(custom[name.lower()][2],
                                                           argstr.strip(), run_shell)
                     config.console.print(f"[dim]{escape(name.lower())} → "

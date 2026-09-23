@@ -227,9 +227,16 @@ def install_completer(readline, custom_names):
     # Only whitespace separates words: '/' and '@' are part of what is typed.
     readline.set_completer_delims(" \t\n")
 
+    # readline calls this once per candidate (state 0, 1, …) for one Tab, so
+    # the list is built at state 0 and indexed after — otherwise every
+    # candidate would re-glob the directory and re-read every command file.
+    matches = []
+
     def completer(text, state):
-        line_start = readline.get_begidx() == 0
-        matches    = complete(text, line_start, custom_names())
+        if state == 0:
+            line_start = readline.get_begidx() == 0
+            names      = custom_names() if line_start and text.startswith("/") else ()
+            matches[:] = complete(text, line_start, names)
         return matches[state] if state < len(matches) else None
     readline.set_completer(completer)
     if "libedit" in (readline.__doc__ or ""):

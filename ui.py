@@ -415,13 +415,17 @@ _FAIL_PREFIXES = ("[no such", "[error", "[bad args", "[unknown tool", "[tool err
                   "[could not start")
 
 
+# run_cmd ends its result with this when the command exited non-zero.
+_EXIT_RE = re.compile(r"\[exit (\d+)(?:, no output)?\]$")
+
+
 def tool_failed(name, result):
     if result.startswith(_FAIL_PREFIXES) or "\n[warning:" in result:
         return True
     if " is a directory, not a file]" in result.split("\n", 1)[0]:
         return name != "read_file"          # read_file answers with a listing
     if name == "run_cmd":
-        m = re.search(r"\[exit (\d+)(?:, no output)?\]$", result)
+        m = _EXIT_RE.search(result)
         if m:
             return m.group(1) != "0"
         return "[timed out after" in result or "[the user stopped" in result
@@ -458,7 +462,6 @@ def tool_call_label(name, args):
 
 def tool_outcome(name, result):
     """A few words on what came back, for the end of the call line."""
-    first = result.split("\n", 1)[0]
     if name == "read_file":
         # Not necessarily the first line: a latin-1 file's note comes first.
         m = re.search(r"^\[lines (\d+-\d+ of \d+)", result, re.M)
@@ -482,7 +485,7 @@ def tool_outcome(name, result):
         n    += int(more.group(1)) if more else 0
         return f"{n} entr{'ies' if n != 1 else 'y'}" if name == "list_dir" else f"{n} found"
     if name == "run_cmd":
-        m = re.search(r"\[exit (\d+)(?:, no output)?\]$", result)
+        m = _EXIT_RE.search(result)
         if m:
             return f"exit {m.group(1)}"
         if "[timed out after" in result:

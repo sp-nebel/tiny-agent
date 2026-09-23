@@ -256,10 +256,12 @@ def _similar_paths(path, limit=3):
     seen    = 0
     for root, dirs, files in os.walk("."):
         dirs[:] = [d for d in dirs if d not in config.SKIP_DIRS and not d.startswith(".")]
-        for f in files:
+        # Checked per file, not per directory: one flat directory of 100k
+        # files would otherwise blow straight through the cap.
+        for f in files[:config.SIMILAR_PATHS_SCAN - seen]:
             by_name.setdefault(f, []).append(os.path.normpath(os.path.join(root, f)))
-            seen += 1
-        if seen > config.SIMILAR_PATHS_SCAN:
+        seen += len(files)
+        if seen >= config.SIMILAR_PATHS_SCAN:
             break
     out = []
     for name in difflib.get_close_matches(want, list(by_name), n=limit, cutoff=0.6):
@@ -365,6 +367,9 @@ def read_file(path, start=1, end=None):
     return (enc_note + body) if body else "[empty file]"
 
 
+_GREP_LINENO_RE = re.compile(r"(\d+)([:-])")
+
+
 def _grep_records(raw):
     """Parse `--null` grep/rg output into match groups.
 
@@ -384,7 +389,7 @@ def _grep_records(raw):
         path, sep, rest = line.partition("\0")
         if not sep:
             continue
-        m = re.match(r"(\d+)([:-])", rest)
+        m = _GREP_LINENO_RE.match(rest)
         if not m:
             continue
         cur.append((path, int(m.group(1)), m.group(2) == ":", rest[m.end():]))
@@ -566,9 +571,10 @@ def _fuzzy_match(content, old, new):
     n = len(old_lines)
     for label, norm in _FUZZY_PASSES:
         target = [norm(l) for l in old_lines]
+        # Once per line, not once per window it falls in.
+        normed = [norm(l) for l in file_lines]
         hits = [i for i in range(len(file_lines) - n + 1)
-                if norm(file_lines[i]) == target[0]
-                and all(norm(file_lines[i + k]) == target[k] for k in range(1, n))]
+                if normed[i] == target[0] and normed[i:i + n] == target]
         if not hits:
             continue
         if len(hits) > 1:
@@ -973,13 +979,19 @@ ARG_ALIASES = {
 }
 
 
-def tool_name(name):
-    """The real tool a model-supplied name refers to, or None. Tolerates
-    case, a "functions." prefix and the aliases above."""
+def _bare_name(name):
+    """The model's tool name without case or a "functions."-style prefix."""
     n = (name or "").strip().lower()
     for prefix in ("functions.", "tools.", "default_api."):
         if n.startswith(prefix):
             n = n[len(prefix):]
+    return n
+
+
+def tool_name(name):
+    """The real tool a model-supplied name refers to, or None. Tolerates
+    case, a "functions." prefix and the aliases above."""
+    n = _bare_name(name)
     n = TOOL_ALIASES.get(n, n)
     return n if n in TOOLS else None
 
@@ -1025,8 +1037,7 @@ def normalize_call(name, args):
     real = tool_name(name)
     if real is None:
         return None, args
-    raw = (name or "").strip().lower().split(".")[-1]
-    return real, _repair_args(raw, real, TOOLS[real], args)
+    return real, _repair_args(_bare_name(name), real, TOOLS[real], args)
 
 
 def dispatch(name, args):

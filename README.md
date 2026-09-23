@@ -166,6 +166,10 @@ For typing, any keypress other than Esc or Tab opens a prompt for a message to t
 
 Newest first. Every commit adds its entry here (see `CLAUDE.md`).
 
+### 2026-09-23
+
+- **Cleanup after #5**: Tab completion no longer re-reads every custom command file and re-globs the directory once per candidate. It builds the list once per Tab press and reads commands only when completing a `/word`. The "did you mean" path search now stops at its file cap even inside one huge directory. Fuzzy `edit_file` matching is cheaper on long files. The rest is internal tidying with no visible change (one retry path in `ollama.py`, one tool-name normalizer, one turn clock).
+
 ### 2026-09-18
 
 - **Stdin piping** (`5af5b9c`, `37662ba`, merged in #5): `git diff | local_agent.py "review this"` sends the piped text with the prompt, runs one turn and exits (code 1 if it failed); piped runs aren't autosaved as sessions. With stdout piped as well, only the final answer goes to stdout, as plain Markdown. Without a terminal, edits and commands are refused unless `--yes` is given.
