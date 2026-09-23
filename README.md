@@ -168,6 +168,7 @@ Newest first. Every commit adds its entry here (see `CLAUDE.md`).
 
 ### 2026-09-23
 
+- **Failed commands no longer shown as `exit 0` on repeats**: when the model ran the same command a third time with the same output, the note added to the result made a failing command (or a `read_file` that hit end of file) show up as a success. The failure body stayed hidden too. Now the outcome is worked out from the tool's own output, so it shows correctly. The model still gets exactly the same text. Tests added for this, for the Tab-completion caching and for the "did you mean" file cap.
 - **Cleanup after #5** (`594a1be`, merged in #6): Tab completion no longer re-reads every custom command file and re-globs the directory once per candidate. It builds the list once per Tab press and reads commands only when completing a `/word`. The "did you mean" path search now stops at its file cap even inside one huge directory. Fuzzy `edit_file` matching is cheaper on long files. The rest is internal tidying with no visible change (one retry path in `ollama.py`, one tool-name normalizer, one turn clock).
 
 ### 2026-09-18

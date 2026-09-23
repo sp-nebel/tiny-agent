@@ -222,8 +222,9 @@ def complete(text, line_start, custom_names):
 
 def install_completer(readline, custom_names):
     """Tab-complete `@paths` and `/commands` at the main prompt.
-    `custom_names` is called on every completion, so commands added while
-    the agent runs are offered too."""
+    `custom_names` is called on each Tab press that completes a `/word` at
+    the start of the line, so commands added while the agent runs are
+    offered too."""
     # Only whitespace separates words: '/' and '@' are part of what is typed.
     readline.set_completer_delims(" \t\n")
 
