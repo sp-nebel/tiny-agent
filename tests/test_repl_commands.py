@@ -174,3 +174,26 @@ def test_completion(tmp_path, monkeypatch):
     assert commands.complete("/he", True, []) == ["/help"]
     assert commands.complete("/re", True, ["/review"]) == ["/resume", "/review"]
     assert commands.complete("/he", False, []) == []
+
+
+def test_completer_builds_matches_once_per_tab(monkeypatch):
+    # readline asks for candidate 0, 1, … in turn; only state 0 may do work.
+    class FakeReadline:
+        __doc__ = ""
+        begidx  = 0
+        def set_completer_delims(self, d): pass
+        def parse_and_bind(self, s): pass
+        def set_completer(self, fn): self.fn = fn
+        def get_begidx(self): return self.begidx
+    rl, calls = FakeReadline(), []
+    commands.install_completer(rl, lambda: calls.append(1) or {"/review": None})
+    got = []
+    state = 0
+    while (m := rl.fn("/re", state)) is not None:
+        got.append(m)
+        state += 1
+    assert got == ["/resume", "/review"] and calls == [1]
+    rl.fn("@nothing-here", 0)                 # no /word: custom names not loaded
+    rl.begidx = 3
+    rl.fn("/re", 0)                           # not at line start: nor here
+    assert calls == [1]

@@ -43,3 +43,18 @@ def test_line_numbers_follow_universal_newlines(tmp_path):
     p = tmp_path / "f.txt"
     p.write_bytes(b"a\r\nb\rc\x0cd\n")
     assert read_file(str(p)) == "    1  a\n    2  b\n    3  c\x0cd\n[end of file, 3 lines]"
+
+
+def test_did_you_mean_scan_stops_inside_one_big_directory(tmp_path, monkeypatch):
+    import config
+    import tools
+    monkeypatch.chdir(tmp_path)
+    for i in range(20):
+        (tmp_path / f"f{i:02}.py").write_text("")
+    monkeypatch.setattr(config, "SIMILAR_PATHS_SCAN", 5)
+    seen = []
+    real = tools.difflib.get_close_matches
+    monkeypatch.setattr(tools.difflib, "get_close_matches",
+                        lambda want, names, **kw: seen.append(len(names)) or real(want, names, **kw))
+    tools._similar_paths("f0.py")
+    assert seen == [5]

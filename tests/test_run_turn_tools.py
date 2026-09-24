@@ -54,3 +54,20 @@ def test_ctrl_c_in_run_cmd_reports_partial_output(env, monkeypatch):
     tools = [m["content"] for m in messages if m["role"] == "tool"]
     assert tools == ["half done\n" + USER_STOPPED_CMD, "[interrupted before this tool ran]"]
     assert_well_formed(messages)
+
+
+def test_repeat_note_does_not_hide_a_failed_command(env, monkeypatch):
+    # The note goes after "[exit 1]"; the display must still see the failure.
+    import io
+    from rich.console import Console
+    buf = io.StringIO()
+    monkeypatch.setattr(config, "console", Console(file=buf, force_terminal=False, width=200))
+    monkeypatch.setattr(config, "REPEAT_CALL_LIMIT", 2)
+    env["tool_result"] = "FAILED test_x\n[exit 1]"
+    env["install"]([reply(tool_calls=[call("run_cmd", cmd="pytest")]) for _ in range(2)]
+                   + [reply(content="done")])
+    run_turn(fresh())
+    shown = buf.getvalue()
+    assert "exit 0" not in shown
+    assert shown.count("FAILED test_x") == 2      # body printed both times
+    assert "exact run_cmd call 2 times" in shown

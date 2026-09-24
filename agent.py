@@ -424,13 +424,16 @@ def _print_answer(content):
         config.console.print(Markdown(content))
 
 
-def _show_result(name, label, early, result):
+def _show_result(name, label, early, result, note=""):
     """Print a tool call's outcome: one line normally, the body too when it
     failed or /details is on. Display only — the model gets the full result
-    either way. Rich reads any "[word …]" as a markup tag and drops an
-    unknown one silently, so everything here is escaped."""
+    either way. `note` is text agent.py appends to the result; it is shown
+    with the body but not parsed for the outcome. Rich reads any "[word …]"
+    as a markup tag and drops an unknown one silently, so everything here
+    is escaped."""
     outcome = tool_outcome(name, result)
     failed  = tool_failed(name, result)
+    result += note
     if early:
         # A failed command's body is printed below and ends with its exit.
         if outcome and name == "run_cmd" and not failed:
@@ -652,9 +655,13 @@ def run_turn(messages, max_steps=20, check_every=20):
                     last, n = repeats.get(key, (None, 0))
                     n = n + 1 if result == last else 1
                     repeats[key] = (result, n)
-                    if n >= config.REPEAT_CALL_LIMIT:
-                        result += "\n" + REPEAT_CALL_NOTE.format(name=shown, n=n)
-                    _show_result(shown, label, early, result)
+                    # Judged before the note is added: it would push the
+                    # "[exit N]" and end-of-file markers off the end, and a
+                    # failed command would show as "exit 0".
+                    note = ("\n" + REPEAT_CALL_NOTE.format(name=shown, n=n)
+                            if n >= config.REPEAT_CALL_LIMIT else "")
+                    _show_result(shown, label, early, result, note)
+                    result += note
 
                     # Tool results use role "tool", one message per call.
                     messages.append({"role": "tool", "content": result, "name": shown})
@@ -989,7 +996,7 @@ def main():
             with contextlib.suppress(OSError):
                 readline.write_history_file(histfile)
         atexit.register(save_history)
-        commands.install_completer(readline, lambda: list(custom_commands()))
+        commands.install_completer(readline, custom_commands)
 
     messages       = [{"role": "system", "content": config.SYSTEM}]
     first_user_msg = True
